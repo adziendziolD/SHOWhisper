@@ -33,6 +33,7 @@ let overlayWindow = null
 let settingsWindow = null
 let whisperPipeline = null
 let isLoadingModel = false
+let loadGeneration = 0         // verhindert, dass ein überholter Ladevorgang State überschreibt
 let hotkeyWorker = null        // aktueller Child-Process (siehe hotkey-worker.js)
 let hotkeyHolding = false      // Crash-Recovery: läuft gerade eine Aufnahme?
 let hotkeyRespawnCount = 0
@@ -125,6 +126,11 @@ async function loadModel(modelName, force = false) {
     log('loadModel: bereits am Laden, übersprungen')
     return
   }
+  // Jeder Aufruf bekommt eine eigene Generation. Startet ein force-Reload
+  // (z.B. Provider-Wechsel) während noch ein Ladevorgang läuft, erkennt der
+  // ältere nach seinem await, dass er überholt wurde, und verwirft sein
+  // Ergebnis, statt frisch geladenen State zu überschreiben.
+  const myGen = ++loadGeneration
   isLoadingModel = true
   updateTrayLabel(`Lade ${modelName}…`)
   overlayWindow?.showInactive()
@@ -234,8 +240,9 @@ async function loadModel(modelName, force = false) {
     //   CoreML + q8 stürzt weiterhin (Quantisierung + CoreML verträgt sich
     //   nicht), daher fp32 statt q8 für den CoreML-Pfad.
     const preferredDevice = process.platform === 'darwin' ? 'coreml' : 'cpu'
+    let pipe
     try {
-      whisperPipeline = await pipeline(
+      pipe = await pipeline(
         'automatic-speech-recognition',
         modelId,
         { device: preferredDevice, dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback }
@@ -243,12 +250,19 @@ async function loadModel(modelName, force = false) {
     } catch (deviceErr) {
       if (preferredDevice === 'cpu') throw deviceErr
       logErr(`Gerät '${preferredDevice}' fehlgeschlagen, Fallback auf CPU:`, deviceErr.message)
-      whisperPipeline = await pipeline(
+      pipe = await pipeline(
         'automatic-speech-recognition',
         modelId,
         { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback }
       )
     }
+    // Zwischenzeitlich durch einen neueren Ladevorgang überholt? Dann Ergebnis
+    // verwerfen, damit wir nicht das gerade frisch geladene Modell überschreiben.
+    if (myGen !== loadGeneration) {
+      log(`loadModel: ${modelId} wurde überholt, Ergebnis verworfen`)
+      return
+    }
+    whisperPipeline = pipe
     log(`Modell bereit: ${modelId}`)
     store.set('model', modelName)
     updateTrayLabel(null)
@@ -256,6 +270,12 @@ async function loadModel(modelName, force = false) {
     sendModelProgress({ status: 'ready' })
     setTimeout(() => overlayWindow?.hide(), 500)
   } catch (err) {
+    // Überholter Ladevorgang: Fehler gehört nicht mehr zum aktiven Modell,
+    // still verwerfen (der neuere Ladevorgang besitzt den State jetzt).
+    if (myGen !== loadGeneration) {
+      log(`loadModel: überholter Ladevorgang mit Fehler verworfen (${err.message})`)
+      return
+    }
     logErr('Model load error:', err.message)
     updateTrayLabel('Fehler beim Laden')
 
@@ -280,7 +300,9 @@ async function loadModel(modelName, force = false) {
       )
     }
   } finally {
-    isLoadingModel = false
+    // Nur zurücksetzen, wenn kein neuerer Ladevorgang die Führung übernommen
+    // hat - sonst würde ein überholter Alt-Lauf das Flag des aktiven löschen.
+    if (myGen === loadGeneration) isLoadingModel = false
   }
 }
 
@@ -380,9 +402,12 @@ ipcMain.handle('settings-save', async (_e, data) => {
   store.set('provider', data.provider)
   store.set('hfToken',  data.hfToken)
 
-  // Modell mit neuen Settings neu laden (force=true überschreibt laufenden Versuch)
+  // Modell mit neuen Settings neu laden. force=true umgeht die "lädt bereits"-
+  // Sperre; ein evtl. noch laufender Ladevorgang wird über die loadGeneration
+  // sauber verworfen (kein manuelles isLoadingModel-Zurücksetzen mehr nötig,
+  // das war zuvor die Race-Ursache). whisperPipeline auf null, damit während
+  // des Reloads nicht mit dem alten Modell transkribiert wird.
   whisperPipeline = null
-  isLoadingModel  = false
   const currentModel = store.get('model', 'small')
   await loadModel(currentModel, true)
 })
@@ -391,7 +416,7 @@ ipcMain.handle('settings-save', async (_e, data) => {
 
 ipcMain.on('audio-ready', async (_event, pcm) => {
   log(`Audio empfangen: ${pcm.length} samples`)
-  overlayWindow.webContents.send('transcribing')
+  overlayWindow?.webContents.send('transcribing')
 
   let text = ''
   try {
@@ -407,7 +432,7 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
     clipboard.writeText(text)
 
     // Fenster kurz focussieren lassen dann paste simulieren
-    overlayWindow.hide()
+    overlayWindow?.hide()
     await new Promise(r => setTimeout(r, 80))
 
     const { keyboard, Key } = require('@nut-tree-fork/nut-js')
@@ -424,8 +449,26 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
     setTimeout(() => clipboard.writeText(prev), 500)
   }
 
-  overlayWindow.webContents.send('done')
-  setTimeout(() => overlayWindow.hide(), 700)
+  overlayWindow?.webContents.send('done')
+  setTimeout(() => overlayWindow?.hide(), 700)
+})
+
+// Renderer meldet, dass die Aufnahme nicht starten konnte (z.B. Mikrofon-
+// Berechtigung verweigert). Overlay/Tray zurücksetzen und den Worker-Toggle
+// resetten, sonst bleibt der Zustand hängen (nächster ⌥Space nur Resync).
+ipcMain.on('recording-failed', (_e, message) => {
+  logErr('Aufnahme fehlgeschlagen (Renderer):', message)
+  hotkeyHolding = false
+  setTrayRecording(false)
+  overlayWindow?.hide()
+  try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* Kanal evtl. schon zu */ }
+  if (!settingsWindow || settingsWindow.isDestroyed()) {
+    dialog.showErrorBox(
+      'Mikrofon nicht verfügbar',
+      `Die Aufnahme konnte nicht gestartet werden:\n${message || 'Unbekannter Fehler'}\n\n` +
+      'Bitte Mikrofon-Zugriff erlauben unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Mikrofon'
+    )
+  }
 })
 
 // ── Tray ──────────────────────────────────────────────────────────────────────

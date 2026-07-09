@@ -7,5 +7,6 @@ contextBridge.exposeInMainWorld('whisper', {
   onDone:           (cb) => ipcRenderer.on('done', cb),
   onModelLoading:   (cb) => ipcRenderer.on('model-loading', (_e, data) => cb(data)),
   sendAudio:        (buffer) => ipcRenderer.send('audio-ready', buffer),
+  recordingFailed:  (msg) => ipcRenderer.send('recording-failed', msg),
   overlayReady:     () => ipcRenderer.send('overlay-ready'),
 })

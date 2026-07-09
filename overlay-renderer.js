@@ -11,6 +11,7 @@ let mediaRecorder = null
 let audioChunks   = []
 let animFrameId   = null
 let analyser      = null
+let audioCtx      = null
 let timerInterval = null
 let startTime     = 0
 
@@ -96,9 +97,22 @@ function stopTimer() {
 async function startRecording() {
   audioChunks = []
 
-  const stream  = await navigator.mediaDevices.getUserMedia({ audio: true })
-  const audioCtx = new AudioContext()
-  const source  = audioCtx.createMediaStreamSource(stream)
+  // Mikrofonzugriff kann scheitern (Berechtigung verweigert, kein Gerät). Ohne
+  // Fang bliebe die Pill sichtbar aber zustandslos hängen und Tray/Worker-Toggle
+  // desynchronisiert - stattdessen sauber abbrechen und den Main-Prozess das
+  // Recording-Fenster/Tray/den Worker-Toggle zurücksetzen lassen.
+  let stream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch (err) {
+    console.error('[overlay] Mikrofonzugriff fehlgeschlagen:', err)
+    setState('')
+    window.whisper.recordingFailed(err?.message || String(err))
+    return
+  }
+
+  audioCtx       = new AudioContext()
+  const source   = audioCtx.createMediaStreamSource(stream)
   analyser       = audioCtx.createAnalyser()
   analyser.fftSize = 512
   source.connect(analyser)
@@ -149,6 +163,11 @@ async function stopRecording() {
     mediaRecorder.stop()
     mediaRecorder.stream.getTracks().forEach((t) => t.stop())
   })
+
+  // AudioContext schließen - Browser limitieren die Zahl offener Contexts
+  // (~6), sonst schlägt new AudioContext() nach einigen Aufnahmen fehl.
+  if (audioCtx) { audioCtx.close(); audioCtx = null }
+  mediaRecorder = null
 
   const blob = new Blob(audioChunks, { type: 'audio/webm' })
   console.log('[overlay] stopRecording: Blob', blob.size, 'bytes,', audioChunks.length, 'chunks')
