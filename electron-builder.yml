@@ -1,0 +1,28 @@
+appId: com.showisper.app
+productName: SHOWisper
+
+mac:
+  icon: assets/icon.icns
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  category: public.app-category.productivity
+
+win:
+  icon: assets/icon.ico
+  target:
+    - target: nsis
+
+files:
+  - "**/*"
+  - "!node_modules/electron-builder/**"
+
+asar: true
+# Native Module müssen aus dem asar-Archiv ausgepackt werden, sonst findet
+# der Loader die *.node/*.dylib-Binaries im gepackten Build nicht (App startet
+# lokal via `npm start`, aber die .dmg-Version lädt die Module nicht).
+asarUnpack:
+  - "**/node_modules/@mukea/uiohook-napi/**"
+  - "**/node_modules/@nut-tree-fork/**"
+  - "**/node_modules/onnxruntime-node/**"
+  - "**/*.node"

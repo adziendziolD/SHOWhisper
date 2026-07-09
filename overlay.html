@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SHOWisper Overlay</title>
+  <link rel="stylesheet" href="overlay.css" />
+</head>
+<body>
+  <div id="pill">
+    <div id="state-loading">
+      <svg id="loading-spinner" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2.5"
+          stroke-dasharray="31.4" stroke-dashoffset="10" stroke-linecap="round"/>
+      </svg>
+      <span id="loading-label">Modell wird geladen…</span>
+      <div id="loading-bar-track">
+        <div id="loading-bar-fill"></div>
+      </div>
+      <span id="loading-pct">0%</span>
+    </div>
+
+    <div id="state-recording">
+      <span id="rec-dot"></span>
+      <canvas id="waveform" width="180" height="36"></canvas>
+      <span id="rec-timer">0:00</span>
+    </div>
+
+    <div id="state-transcribing">
+      <svg id="spinner" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2.5"
+          stroke-dasharray="31.4" stroke-dashoffset="10" stroke-linecap="round"/>
+      </svg>
+      <span>Wird transkribiert…</span>
+    </div>
+
+    <div id="state-done">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    </div>
+  </div>
+
+  <script src="overlay-renderer.js"></script>
+</body>
+</html>

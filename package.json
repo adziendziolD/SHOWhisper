@@ -1,0 +1,24 @@
+{
+  "name": "showisper",
+  "version": "0.1.0",
+  "description": "Local Whisper dictation app with menubar and floating overlay",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "NODE_ENV=development electron . --inspect=5858",
+    "build": "electron-builder"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@mukea/uiohook-napi": "^2.0.1",
+    "@nut-tree-fork/nut-js": "^4.2.6",
+    "electron-store": "^11.0.2"
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
+  },
+  "overrides": {
+    "onnxruntime-node": "1.24.3"
+  }
+}
