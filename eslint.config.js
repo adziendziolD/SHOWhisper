@@ -27,12 +27,12 @@ const commonRules = {
 module.exports = [
   { ignores: ['dist/**', 'node_modules/**', 'assets/**'] },
   {
-    files: ['main.js', 'hotkey-worker.js', 'preload.js', 'settings-preload.js'],
+    files: ['src/main/**/*.js', 'src/preload/**/*.js', 'src/shared/**/*.js'],
     languageOptions: { ecmaVersion: 2022, sourceType: 'commonjs', globals: nodeGlobals },
     rules: commonRules,
   },
   {
-    files: ['overlay-renderer.js'],
+    files: ['src/renderer/**/*.js'],
     languageOptions: { ecmaVersion: 2022, sourceType: 'script', globals: browserGlobals },
     rules: commonRules,
   },

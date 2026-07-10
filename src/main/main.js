@@ -2,14 +2,14 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPrefer
 const path = require('path')
 const fs = require('fs')
 const { fork } = require('child_process')
-const { t, translations } = require('./i18n')
+const { t, translations } = require('../shared/i18n')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
 
 // Don't crash on EPIPE (e.g. when the terminal is closed)
-process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
-process.stderr.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
+process.stdout.on('error', (e) => { if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EPIPE') throw e })
+process.stderr.on('error', (e) => { if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EPIPE') throw e })
 
 // ── Logging (electron-log, size-based rotation) ────────────────────────────────
 // Persisted to the OS log dir (macOS: ~/Library/Logs/<AppName>/main.log,
@@ -32,16 +32,25 @@ elog.transports.file.archiveLogFn = (file) => {
     fs.renameSync(oldPath, path.join(dir, `${name}.1${ext}`))
   } catch {
     // Fallback: crop the current file rather than lose logging entirely.
-    try { file.crop(Math.min(Math.round(LOG_MAX_SIZE / 4), 256 * 1024)) } catch { /* ignore */ }
+    try { /** @type {any} */ (file).crop(Math.min(Math.round(LOG_MAX_SIZE / 4), 256 * 1024)) } catch { /* ignore */ }
   }
 }
 
 function log(...args) { elog.info(...args) }
 function logErr(...args) { elog.error(...args) }
 
+/**
+ * Extract a human-readable message from an unknown thrown value.
+ * @param {unknown} e
+ * @returns {string}
+ */
+function errMsg(e) { return e instanceof Error ? e.message : String(e) }
+
 // electron-store is ESM-only since v9, main.js is CommonJS -> import it
-// dynamically once the app is ready (see app.whenReady())
-let store = null
+// dynamically once the app is ready (see app.whenReady()). Typed non-null:
+// every access happens after whenReady has assigned it.
+/** @type {import('electron-store').default<Record<string, unknown>>} */
+let store
 
 // Translate a UI string into the currently selected language (see i18n.js).
 // Only called after the store is ready (tray/dialogs run after whenReady).
@@ -49,15 +58,21 @@ function tr(key, vars) {
   return t(store.get('language', 'german'), key, vars)
 }
 
-let tray = null
+/** @type {import('electron').Tray} */
+let tray                       // assigned in createTray() during whenReady
+/** @type {import('electron').BrowserWindow | null} */
 let overlayWindow = null
+/** @type {import('electron').BrowserWindow | null} */
 let settingsWindow = null
-let whisperPipeline = null
+/** @type {any} */
+let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
 let isLoadingModel = false
 let loadGeneration = 0         // prevents a superseded load from overwriting state
+/** @type {import('child_process').ChildProcess | null} */
 let hotkeyWorker = null        // current child process (see hotkey-worker.js)
 let hotkeyHolding = false      // crash recovery: is a recording in progress?
 let hotkeyRespawnCount = 0
+/** @type {ReturnType<typeof setTimeout> | null} */
 let hotkeyStableTimer = null
 let hotkeyDisabled = false     // circuit breaker tripped -> no further respawn
 let isQuitting = false
@@ -77,10 +92,10 @@ const PROVIDER_MODELS = {
 
 function createOverlay() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize
-  const savedPos = store.get('overlayPosition', {
+  const savedPos = /** @type {{ x: number, y: number }} */ (store.get('overlayPosition', {
     x: Math.round(width / 2 - 175),
     y: height - 120,
-  })
+  }))
 
   overlayWindow = new BrowserWindow({
     x: savedPos.x,
@@ -95,12 +110,12 @@ function createOverlay() {
     resizable: false,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
     },
   })
 
-  overlayWindow.loadFile('overlay.html')
+  overlayWindow.loadFile(path.join(__dirname, '../renderer/overlay.html'))
 
   if (isDev) {
     overlayWindow.webContents.openDevTools({ mode: 'detach' })
@@ -108,6 +123,7 @@ function createOverlay() {
   }
 
   overlayWindow.on('moved', () => {
+    if (!overlayWindow) return
     const [x, y] = overlayWindow.getPosition()
     store.set('overlayPosition', { x, y })
   })
@@ -128,6 +144,7 @@ function sendToSettings(data) {
 // missed) or the settings window (only when open) - also show it in the
 // overlay pill, which is always available, regardless of what triggered the
 // download (startup, tray menu, settings).
+/** @type {ModelLoadingData | null} */
 let lastModelProgress = null
 function sendModelProgress(data) {
   lastModelProgress = data
@@ -269,7 +286,7 @@ async function loadModel(modelName, force = false) {
       )
     } catch (deviceErr) {
       if (preferredDevice === 'cpu') throw deviceErr
-      logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, deviceErr.message)
+      logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, errMsg(deviceErr))
       pipe = await pipeline(
         'automatic-speech-recognition',
         modelId,
@@ -293,21 +310,21 @@ async function loadModel(modelName, force = false) {
     // Superseded load: the error no longer belongs to the active model,
     // discard it silently (the newer load owns the state now).
     if (myGen !== loadGeneration) {
-      log(`loadModel: superseded load with error discarded (${err.message})`)
+      log(`loadModel: superseded load with error discarded (${errMsg(err)})`)
       return
     }
-    logErr('Model load error:', err.message)
+    logErr('Model load error:', errMsg(err))
     updateTrayLabel(tr('tray.loadError'))
 
     // Delete the corrupt cache so the next attempt downloads fresh
-    const provider    = store.get('provider', 'Xenova')
+    const provider    = /** @type {string} */ (store.get('provider', 'Xenova'))
     const corruptPath = path.join(MODEL_CACHE_DIR, provider, `whisper-${modelName}`)
     if (fs.existsSync(corruptPath)) {
       fs.rmSync(corruptPath, { recursive: true, force: true })
       log('Deleted corrupt cache:', corruptPath)
     }
 
-    sendModelProgress({ status: 'error', message: err.message })
+    sendModelProgress({ status: 'error', message: errMsg(err) })
     overlayWindow?.hide()
 
     // The tray tooltip alone is easily missed (e.g. when selecting via the
@@ -316,7 +333,7 @@ async function loadModel(modelName, force = false) {
     if (!settingsWindow || settingsWindow.isDestroyed()) {
       dialog.showErrorBox(
         tr('dialog.modelError.title'),
-        tr('dialog.modelError.body', { model: `${provider}/whisper-${modelName}`, error: err.message })
+        tr('dialog.modelError.body', { model: `${provider}/whisper-${modelName}`, error: errMsg(err) })
       )
     }
   } finally {
@@ -396,12 +413,12 @@ function setHfToken(token) {
 }
 
 function getHfToken() {
-  const enc = store.get('hfTokenEnc', '')
+  const enc = /** @type {string} */ (store.get('hfTokenEnc', ''))
   if (enc) {
     try {
       return safeStorage.decryptString(Buffer.from(enc, 'base64'))
     } catch (e) {
-      logErr('Could not decrypt HF token:', e.message)
+      logErr('Could not decrypt HF token:', errMsg(e))
       return ''
     }
   }
@@ -422,12 +439,12 @@ function openSettings() {
     resizable: false,
     titleBarStyle: 'default',
     webPreferences: {
-      preload: path.join(__dirname, 'settings-preload.js'),
+      preload: path.join(__dirname, '../preload/settings-preload.js'),
       contextIsolation: true,
     },
   })
 
-  settingsWindow.loadFile('settings.html')
+  settingsWindow.loadFile(path.join(__dirname, '../renderer/settings.html'))
   if (isDev) settingsWindow.webContents.openDevTools({ mode: 'detach' })
   settingsWindow.on('closed', () => { settingsWindow = null })
 }
@@ -598,7 +615,7 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
     // Only log the recognized text in dev mode (privacy for dictation).
     log(isDev ? `Transcription: "${text}"` : `Transcription done (${text.length} chars)`)
   } catch (err) {
-    logErr('Transcription error:', err.message)
+    logErr('Transcription error:', errMsg(err))
   }
 
   if (text) {
@@ -679,7 +696,7 @@ function buildTrayMenu() {
 
 function createTray() {
   const { nativeImage } = require('electron')
-  const idleIcon = nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray-idle.png'))
+  const idleIcon = nativeImage.createFromPath(path.join(__dirname, '..', '..', 'assets', 'tray-idle.png'))
   idleIcon.setTemplateImage(true) // macOS: auto dark/light mode
   tray = new Tray(idleIcon)
   tray.setToolTip('SHOWhisper')
@@ -689,7 +706,7 @@ function createTray() {
 function setTrayRecording(recording) {
   const { nativeImage } = require('electron')
   const name = recording ? 'tray-recording' : 'tray-idle'
-  const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', `${name}.png`))
+  const icon = nativeImage.createFromPath(path.join(__dirname, '..', '..', 'assets', `${name}.png`))
   if (!recording) icon.setTemplateImage(true)
   tray.setImage(icon)
 }
@@ -732,9 +749,10 @@ function spawnHotkeyWorker() {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   })
 
-  hotkeyWorker.on('message', (msg) => {
+  hotkeyWorker.on('message', (raw) => {
+    const msg = /** @type {HotkeyWorkerMessage} */ (raw)
     if (msg?.type === 'started') {
-      log('Hotkey worker ready, PID', hotkeyWorker.pid)
+      log('Hotkey worker ready, PID', hotkeyWorker?.pid)
     } else if (msg?.type === 'start-recording') {
       // While the model is still loading, whisperPipeline is either null or
       // being reassigned - don't start recording, otherwise the audio is lost
@@ -743,17 +761,17 @@ function spawnHotkeyWorker() {
         log('Recording ignored: model still loading')
         // The worker already switched to "recording" internally - reset it,
         // otherwise the next keypress is only spent resyncing (no effect).
-        try { hotkeyWorker.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
+        try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
         return
       }
       hotkeyHolding = true
       setTrayRecording(true)
-      overlayWindow.showInactive()
-      overlayWindow.webContents.send('start-recording')
+      overlayWindow?.showInactive()
+      overlayWindow?.webContents.send('start-recording')
     } else if (msg?.type === 'stop-recording') {
       hotkeyHolding = false
       setTrayRecording(false)
-      overlayWindow.webContents.send('stop-recording')
+      overlayWindow?.webContents.send('stop-recording')
     } else if (msg?.type === 'log') {
       // The worker forwards its logs here so they land in the same log file.
       const fn = msg.level === 'error' ? logErr : log
@@ -764,16 +782,16 @@ function spawnHotkeyWorker() {
   })
 
   hotkeyWorker.on('exit', (code, signal) => handleHotkeyWorkerExit(code, signal))
-  hotkeyWorker.on('error', (err) => logErr('Hotkey worker could not be started:', err.message))
+  hotkeyWorker.on('error', (err) => logErr('Hotkey worker could not be started:', errMsg(err)))
 
   // After a stable runtime, reset the respawn counter so that a single crash
   // after a long error-free runtime doesn't immediately trip the circuit breaker.
-  clearTimeout(hotkeyStableTimer)
+  if (hotkeyStableTimer) clearTimeout(hotkeyStableTimer)
   hotkeyStableTimer = setTimeout(() => { hotkeyRespawnCount = 0 }, 30000)
 }
 
 function handleHotkeyWorkerExit(code, signal) {
-  clearTimeout(hotkeyStableTimer)
+  if (hotkeyStableTimer) clearTimeout(hotkeyStableTimer)
   hotkeyWorker = null
 
   // Crashed in the middle of a held recording -> don't leave overlay/tray hanging
@@ -817,12 +835,14 @@ app.whenReady().then(async () => {
   createOverlay()
   setupHotkey()
 
-  let savedModel = store.get('model', 'small')
+  let savedModel = /** @type {string} */ (store.get('model', 'small'))
   if (!MODELS.includes(savedModel)) savedModel = 'small' // migration: large-v3 → large
   await loadModel(savedModel)
 })
 
-app.on('window-all-closed', (e) => e.preventDefault()) // tray app stays open
+// Electron types this listener as () => void; the running app does receive an
+// event, so keep calling preventDefault to keep the tray app alive.
+app.on('window-all-closed', /** @type {() => void} */ ((e) => /** @type {any} */ (e).preventDefault())) // tray app stays open
 
 app.on('before-quit', () => { isQuitting = true })
 
