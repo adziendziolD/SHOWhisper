@@ -1,17 +1,22 @@
 /* Renderer – runs in the BrowserWindow (overlay) */
 
-const pill        = document.getElementById('pill')
-const canvas      = document.getElementById('waveform')
-const timerEl     = document.getElementById('rec-timer')
-const ctx         = canvas.getContext('2d')
-const loadingBar  = document.getElementById('loading-bar-fill')
-const loadingPct  = document.getElementById('loading-pct')
+const pill        = /** @type {HTMLElement} */ (document.getElementById('pill'))
+const canvas      = /** @type {HTMLCanvasElement} */ (document.getElementById('waveform'))
+const timerEl     = /** @type {HTMLElement} */ (document.getElementById('rec-timer'))
+const ctx         = /** @type {CanvasRenderingContext2D} */ (canvas.getContext('2d'))
+const loadingBar  = /** @type {HTMLElement} */ (document.getElementById('loading-bar-fill'))
+const loadingPct  = /** @type {HTMLElement} */ (document.getElementById('loading-pct'))
 
+/** @type {MediaRecorder | null} */
 let mediaRecorder = null
 let audioChunks   = []
+/** @type {number | null} */
 let animFrameId   = null
+/** @type {AnalyserNode | null} */
 let analyser      = null
+/** @type {AudioContext | null} */
 let audioCtx      = null
+/** @type {ReturnType<typeof setInterval> | null} */
 let timerInterval = null
 let startTime     = 0
 
@@ -88,7 +93,7 @@ function startTimer() {
 }
 
 function stopTimer() {
-  clearInterval(timerInterval)
+  if (timerInterval) clearInterval(timerInterval)
   timerEl.textContent = '0:00'
 }
 
@@ -107,7 +112,7 @@ async function startRecording() {
   } catch (err) {
     console.error('[overlay] Microphone access failed:', err)
     setState('')
-    window.whisper.recordingFailed(err?.message || String(err))
+    window.whisper.recordingFailed(err instanceof Error ? err.message : String(err))
     return
   }
 
@@ -155,13 +160,14 @@ async function stopRecording() {
   if (!mediaRecorder) return
 
   stopTimer()
-  cancelAnimationFrame(animFrameId)
+  if (animFrameId !== null) cancelAnimationFrame(animFrameId)
   ctx.clearRect(0, 0, canvas.width, canvas.height)
 
+  const recorder = mediaRecorder
   await new Promise((resolve) => {
-    mediaRecorder.onstop = resolve
-    mediaRecorder.stop()
-    mediaRecorder.stream.getTracks().forEach((t) => t.stop())
+    recorder.onstop = resolve
+    recorder.stop()
+    recorder.stream.getTracks().forEach((t) => t.stop())
   })
 
   // Close the AudioContext - browsers cap the number of open contexts (~6),
@@ -195,7 +201,8 @@ window.whisper.overlayReady()
 // ── i18n ──────────────────────────────────────────────────────────────────────
 function applyI18n(lang) {
   document.querySelectorAll('[data-i18n]').forEach((el) => {
-    el.textContent = window.i18n.t(lang, el.dataset.i18n)
+    const htmlEl = /** @type {HTMLElement} */ (el)
+    htmlEl.textContent = window.i18n.t(lang, htmlEl.dataset.i18n ?? '')
   })
 }
 window.whisper.getLanguage().then(applyI18n)

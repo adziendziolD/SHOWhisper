@@ -14,6 +14,7 @@
 function send(level, args) {
   const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
   try {
+    if (!process.send) throw new Error('no IPC channel')
     process.send({ type: 'log', level, msg })
   } catch {
     try { (level === 'error' ? console.error : console.log)('[hotkey]', ...args) } catch { /* ignore */ }
@@ -37,7 +38,7 @@ uIOhook.on('keydown', (e) => {
   if (e.keycode === UiohookKey.Space && e.altKey && !isDown) {
     isDown = true
     isRecording = !isRecording
-    process.send({ type: isRecording ? 'start-recording' : 'stop-recording' })
+    process.send?.({ type: isRecording ? 'start-recording' : 'stop-recording' })
   }
 })
 
@@ -47,7 +48,8 @@ uIOhook.on('keyup', (e) => {
   }
 })
 
-process.on('message', (msg) => {
+process.on('message', (raw) => {
+  const msg = /** @type {HotkeyWorkerCommand} */ (raw)
   if (msg?.type === 'shutdown') shutdown('Shutdown requested')
   // main process rejected a start-recording (e.g. model still loading)
   // - reset the toggle state, otherwise the next keypress is only spent
@@ -86,9 +88,10 @@ setTimeout(() => {
   try {
     uIOhook.start()
     log('uIOhook started')
-    process.send({ type: 'started' })
+    process.send?.({ type: 'started' })
   } catch (err) {
-    logErr('Start failed:', err.message)
-    process.send({ type: 'error', message: err.message })
+    const message = err instanceof Error ? err.message : String(err)
+    logErr('Start failed:', message)
+    process.send?.({ type: 'error', message })
   }
 }, 300)

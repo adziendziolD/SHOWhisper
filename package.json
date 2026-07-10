@@ -2,7 +2,7 @@
   "name": "showhisper",
   "version": "0.2.1",
   "description": "Local, private Whisper dictation app for macOS & Windows — menubar app with a floating pill overlay and global hotkey.",
-  "main": "main.js",
+  "main": "src/main/main.js",
   "author": "Adziendz",
   "license": "MIT",
   "homepage": "https://github.com/adziendziolD/SHOWhisper#readme",
@@ -27,7 +27,8 @@
     "start": "electron .",
     "dev": "NODE_ENV=development electron . --inspect=5858",
     "build": "electron-builder",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
@@ -37,9 +38,11 @@
     "electron-store": "^11.0.2"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "electron": "^43.1.0",
     "electron-builder": "^26.15.3",
-    "eslint": "^9.16.0"
+    "eslint": "^9.16.0",
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "onnxruntime-node": "1.24.3"
