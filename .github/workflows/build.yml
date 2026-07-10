@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -32,21 +32,24 @@ jobs:
         include:
           # Each architecture builds on a runner of that architecture, so the
           # native prebuilds npm installs match the target (no cross-arch dmg).
+          # --publish never: electron-builder auto-publishes to GitHub
+          # Releases when it sees a git tag; we publish from the release job
+          # below instead, so disable its implicit publishing here.
           - os: macos-14        # Apple Silicon
-            build: npm run build -- --mac --arm64
+            build: npm run build -- --mac --arm64 --publish never
             artifact: macos-arm64
           - os: macos-13        # Intel
-            build: npm run build -- --mac --x64
+            build: npm run build -- --mac --x64 --publish never
             artifact: macos-x64
           - os: windows-latest
-            build: npm run build -- --win
+            build: npm run build -- --win --publish never
             artifact: windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
       - run: npm ci
       - name: Build installer
