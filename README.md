@@ -46,7 +46,7 @@ On first launch macOS will ask for two permissions — both are required:
 ## Getting started (from source)
 
 ```bash
-git clone https://github.com/Adziendz/SHOWhisper.git
+git clone https://github.com/adziendziolD/SHOWhisper.git
 cd SHOWhisper
 npm install
 npm start
@@ -68,7 +68,7 @@ Choose in the tray menu. Larger models are more accurate (especially for German)
 
 Default: `small`. Models are loaded from the [`Xenova`](https://huggingface.co/Xenova) HuggingFace namespace by default (public, no token). You can switch the provider or add a HuggingFace read-token in **Settings** (the token is stored encrypted via the OS keychain).
 
-> **Language:** the transcription language is currently fixed to German. See [Roadmap](#roadmap).
+> **Language:** German, English and French are selectable in **Settings**, and the whole UI localizes to the chosen language.
 
 ## Building installers
 
@@ -105,7 +105,7 @@ Verbose per-token / PCM diagnostics and transcript logging are only emitted in d
 
 - Auto-update via `electron-updater`
 - Transcription history
-- Configurable language / auto-detect
+- More languages / auto-detect
 - Custom hotkey
 
 ## Tech stack

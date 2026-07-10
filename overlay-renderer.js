@@ -105,7 +105,7 @@ async function startRecording() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true })
   } catch (err) {
-    console.error('[overlay] Mikrofonzugriff fehlgeschlagen:', err)
+    console.error('[overlay] Microphone access failed:', err)
     setState('')
     window.whisper.recordingFailed(err?.message || String(err))
     return
@@ -173,9 +173,9 @@ async function stopRecording() {
   console.log('[overlay] stopRecording: Blob', blob.size, 'bytes,', audioChunks.length, 'chunks')
   const t0 = performance.now()
   const pcm  = await decodeToWhisperPCM(blob)
-  console.log('[overlay] decodeToWhisperPCM fertig nach', (performance.now() - t0).toFixed(0), 'ms,', pcm.length, 'samples')
+  console.log('[overlay] decodeToWhisperPCM done after', (performance.now() - t0).toFixed(0), 'ms,', pcm.length, 'samples')
   window.whisper.sendAudio(pcm)
-  console.log('[overlay] sendAudio() aufgerufen')
+  console.log('[overlay] sendAudio() called')
 }
 
 // ── IPC Events ────────────────────────────────────────────────────────────────

@@ -5,13 +5,13 @@
   "main": "main.js",
   "author": "Adziendz",
   "license": "MIT",
-  "homepage": "https://github.com/Adziendz/SHOWhisper#readme",
+  "homepage": "https://github.com/adziendziolD/SHOWhisper#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Adziendz/SHOWhisper.git"
+    "url": "https://github.com/adziendziolD/SHOWhisper.git"
   },
   "bugs": {
-    "url": "https://github.com/Adziendz/SHOWhisper/issues"
+    "url": "https://github.com/adziendziolD/SHOWhisper/issues"
   },
   "keywords": [
     "whisper",

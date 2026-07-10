@@ -89,7 +89,7 @@ function createOverlay() {
 
   if (isDev) {
     overlayWindow.webContents.openDevTools({ mode: 'detach' })
-    log('Overlay DevTools geöffnet')
+    log('Overlay DevTools opened')
   }
 
   overlayWindow.on('moved', () => {
@@ -130,7 +130,7 @@ ipcMain.on('overlay-ready', () => {
 
 async function loadModel(modelName, force = false) {
   if (isLoadingModel && !force) {
-    log('loadModel: bereits am Laden, übersprungen')
+    log('loadModel: already loading, skipped')
     return
   }
   // Every call gets its own generation. If a forced reload (e.g. provider
@@ -154,13 +154,13 @@ async function loadModel(modelName, force = false) {
         ...options,
         headers: { ...options?.headers, Authorization: `Bearer ${hfToken}` },
       })
-      log('HF-Token gesetzt')
+      log('HF token set')
     }
 
     const provider = store.get('provider', 'Xenova')
     const modelId  = `${provider}/whisper-${modelName}`
-    log(`Lade Modell: ${modelId}`)
-    log(`Cache-Dir:   ${MODEL_CACHE_DIR}`)
+    log(`Loading model: ${modelId}`)
+    log(`Cache dir:    ${MODEL_CACHE_DIR}`)
 
     // Throttle logging: per file only at whole 10% steps
     const lastLoggedPct = {}
@@ -221,7 +221,7 @@ async function loadModel(modelName, force = false) {
           sendModelProgress({ status: 'progress', progress: overallPct })
         }
       } else if (data.status === 'done') {
-        log(`Modell-Status: done`, data.file || '')
+        log(`Model status: done`, data.file || '')
       }
     }
 
@@ -254,7 +254,7 @@ async function loadModel(modelName, force = false) {
       )
     } catch (deviceErr) {
       if (preferredDevice === 'cpu') throw deviceErr
-      logErr(`Gerät '${preferredDevice}' fehlgeschlagen, Fallback auf CPU:`, deviceErr.message)
+      logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, deviceErr.message)
       pipe = await pipeline(
         'automatic-speech-recognition',
         modelId,
@@ -264,11 +264,11 @@ async function loadModel(modelName, force = false) {
     // Superseded by a newer load in the meantime? Then discard the result, so
     // we don't overwrite the model that was just freshly loaded.
     if (myGen !== loadGeneration) {
-      log(`loadModel: ${modelId} wurde überholt, Ergebnis verworfen`)
+      log(`loadModel: ${modelId} was superseded, result discarded`)
       return
     }
     whisperPipeline = pipe
-    log(`Modell bereit: ${modelId}`)
+    log(`Model ready: ${modelId}`)
     store.set('model', modelName)
     updateTrayLabel(null)
     buildTrayMenu()
@@ -278,7 +278,7 @@ async function loadModel(modelName, force = false) {
     // Superseded load: the error no longer belongs to the active model,
     // discard it silently (the newer load owns the state now).
     if (myGen !== loadGeneration) {
-      log(`loadModel: überholter Ladevorgang mit Fehler verworfen (${err.message})`)
+      log(`loadModel: superseded load with error discarded (${err.message})`)
       return
     }
     logErr('Model load error:', err.message)
@@ -289,7 +289,7 @@ async function loadModel(modelName, force = false) {
     const corruptPath = path.join(MODEL_CACHE_DIR, provider, `whisper-${modelName}`)
     if (fs.existsSync(corruptPath)) {
       fs.rmSync(corruptPath, { recursive: true, force: true })
-      log('Korrupter Cache gelöscht:', corruptPath)
+      log('Deleted corrupt cache:', corruptPath)
     }
 
     sendModelProgress({ status: 'error', message: err.message })
@@ -346,22 +346,22 @@ async function transcribe(pcm) {
     let lastTokenAt = tStart
     let tokenCount = 0
     genOptions.streamer = new WhisperTextStreamer(whisperPipeline.tokenizer, {
-      on_chunk_start: (x) => log(`  [streamer] Chunk-Start bei ${x.toFixed(2)}s`),
+      on_chunk_start: (x) => log(`  [streamer] Chunk start at ${x.toFixed(2)}s`),
       token_callback_function: (tokens) => {
         const now = Date.now()
         tokenCount++
-        log(`  [streamer] Token #${tokenCount} (+${now - lastTokenAt}ms, gesamt ${now - tStart}ms):`, tokens)
+        log(`  [streamer] Token #${tokenCount} (+${now - lastTokenAt}ms, total ${now - tStart}ms):`, tokens)
         lastTokenAt = now
       },
       callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
-      on_chunk_end: (x) => log(`  [streamer] Chunk-Ende bei ${x.toFixed(2)}s`),
-      on_finalize: () => log(`  [streamer] Finalisiert`),
+      on_chunk_end: (x) => log(`  [streamer] Chunk end at ${x.toFixed(2)}s`),
+      on_finalize: () => log(`  [streamer] Finalized`),
     })
   }
 
   const t0 = Date.now()
   const result = await whisperPipeline(pcm, genOptions)
-  log(`transcribe(): fertig nach ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   return result.text.trim()
 }
 
@@ -386,7 +386,7 @@ function getHfToken() {
     try {
       return safeStorage.decryptString(Buffer.from(enc, 'base64'))
     } catch (e) {
-      logErr('HF-Token konnte nicht entschlüsselt werden:', e.message)
+      logErr('Could not decrypt HF token:', e.message)
       return ''
     }
   }
@@ -428,7 +428,7 @@ ipcMain.handle('settings-get', () => ({
 ipcMain.on('set-language', (_e, lang) => {
   if (!LANGUAGES.includes(lang)) return
   store.set('language', lang)
-  log('Sprache gesetzt:', lang)
+  log('Language set:', lang)
   // Live-update the localized UI: rebuild the tray menu and tell the windows
   // to re-apply their translations.
   buildTrayMenu()
@@ -543,13 +543,13 @@ ipcMain.handle('cache-list', () => cacheSnapshot())
 
 ipcMain.handle('cache-delete', (_e, { provider, model } = {}) => {
   if (isModelLocked(provider, model)) {
-    logErr('Cache-Löschen abgelehnt: aktives Modell', provider, model)
+    logErr('Cache delete refused: active model', provider, model)
     return cacheSnapshot()
   }
   const dir = safeModelDir(provider, model)
   if (dir && fs.existsSync(dir)) {
     fs.rmSync(dir, { recursive: true, force: true })
-    log('Cache gelöscht:', dir)
+    log('Cache deleted:', dir)
   }
   return cacheSnapshot()
 })
@@ -560,7 +560,7 @@ ipcMain.handle('cache-clear-all', () => {
     const dir = safeModelDir(m.provider, m.model)
     if (dir && fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true, force: true })
-      log('Cache gelöscht:', dir)
+      log('Cache deleted:', dir)
     }
   }
   return cacheSnapshot()
@@ -574,16 +574,16 @@ ipcMain.on('cache-open', () => {
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
 ipcMain.on('audio-ready', async (_event, pcm) => {
-  log(`Audio empfangen: ${pcm.length} samples`)
+  log(`Audio received: ${pcm.length} samples`)
   overlayWindow?.webContents.send('transcribing')
 
   let text = ''
   try {
     text = await transcribe(Float32Array.from(pcm))
     // Only log the recognized text in dev mode (privacy for dictation).
-    log(isDev ? `Transkription: "${text}"` : `Transkription fertig (${text.length} Zeichen)`)
+    log(isDev ? `Transcription: "${text}"` : `Transcription done (${text.length} chars)`)
   } catch (err) {
-    logErr('Transkriptionsfehler:', err.message)
+    logErr('Transcription error:', err.message)
   }
 
   if (text) {
@@ -617,7 +617,7 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
 // denied). Reset overlay/tray and the worker toggle, otherwise the state stays
 // stuck (the next ⌥Space would only resync).
 ipcMain.on('recording-failed', (_e, message) => {
-  logErr('Aufnahme fehlgeschlagen (Renderer):', message)
+  logErr('Recording failed (renderer):', message)
   hotkeyHolding = false
   setTrayRecording(false)
   overlayWindow?.hide()
@@ -685,7 +685,7 @@ function setupHotkey() {
   // Check the accessibility permission (macOS). Without it there's no global keyup/keydown.
   if (process.platform === 'darwin') {
     const trusted = systemPreferences.isTrustedAccessibilityClient(false)
-    log('Accessibility-Check (Hauptprozess):', trusted)
+    log('Accessibility check (main process):', trusted)
     if (!trusted) {
       dialog.showMessageBoxSync({
         type: 'warning',
@@ -719,13 +719,13 @@ function spawnHotkeyWorker() {
 
   hotkeyWorker.on('message', (msg) => {
     if (msg?.type === 'started') {
-      log('Hotkey-Worker bereit, PID', hotkeyWorker.pid)
+      log('Hotkey worker ready, PID', hotkeyWorker.pid)
     } else if (msg?.type === 'start-recording') {
       // While the model is still loading, whisperPipeline is either null or
       // being reassigned - don't start recording, otherwise the audio is lost
       // or transcribe() finds no model.
       if (isLoadingModel) {
-        log('Aufnahme ignoriert: Modell lädt noch')
+        log('Recording ignored: model still loading')
         // The worker already switched to "recording" internally - reset it,
         // otherwise the next keypress is only spent resyncing (no effect).
         try { hotkeyWorker.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
@@ -740,12 +740,12 @@ function spawnHotkeyWorker() {
       setTrayRecording(false)
       overlayWindow.webContents.send('stop-recording')
     } else if (msg?.type === 'error') {
-      logErr('Hotkey-Worker Fehler:', msg.message)
+      logErr('Hotkey worker error:', msg.message)
     }
   })
 
   hotkeyWorker.on('exit', (code, signal) => handleHotkeyWorkerExit(code, signal))
-  hotkeyWorker.on('error', (err) => logErr('Hotkey-Worker konnte nicht gestartet werden:', err.message))
+  hotkeyWorker.on('error', (err) => logErr('Hotkey worker could not be started:', err.message))
 
   // After a stable runtime, reset the respawn counter so that a single crash
   // after a long error-free runtime doesn't immediately trip the circuit breaker.
@@ -767,11 +767,11 @@ function handleHotkeyWorkerExit(code, signal) {
 
   if (isQuitting) return // intentional shutdown, no respawn
 
-  logErr(`Hotkey-Worker beendet (code=${code}, signal=${signal})`)
+  logErr(`Hotkey worker exited (code=${code}, signal=${signal})`)
 
   if (hotkeyRespawnCount >= HOTKEY_MAX_RESPAWNS) {
     hotkeyDisabled = true
-    logErr('Hotkey-Worker wiederholt abgestürzt, Neustart-Versuche eingestellt')
+    logErr('Hotkey worker crashed repeatedly, giving up on restarts')
     updateTrayLabel('Hotkey deaktiviert – App neu starten')
     return
   }
@@ -791,7 +791,7 @@ app.whenReady().then(async () => {
   const { default: Store } = await import('electron-store')
   store = new Store()
 
-  log(`SHOWhisper startet (isDev=${isDev})`)
+  log(`SHOWhisper starting (isDev=${isDev})`)
   log(`userData: ${app.getPath('userData')}`)
   createTray()
   createOverlay()

@@ -46,7 +46,7 @@ uIOhook.on('keyup', (e) => {
 })
 
 process.on('message', (msg) => {
-  if (msg?.type === 'shutdown') shutdown('Shutdown angefordert')
+  if (msg?.type === 'shutdown') shutdown('Shutdown requested')
   // main process rejected a start-recording (e.g. model still loading)
   // - reset the toggle state, otherwise the next keypress is only spent
   // resyncing (no effect for the user).
@@ -57,7 +57,7 @@ process.on('message', (msg) => {
 // 'disconnect' alone isn't enough - if the Electron main process dies abruptly
 // (e.g. SIGTERM instead of a clean app.quit()), the IPC channel doesn't close
 // reliably, so additionally watch the parent process actively.
-process.on('disconnect', () => shutdown('IPC-Kanal getrennt'))
+process.on('disconnect', () => shutdown('IPC channel disconnected'))
 
 // process.kill(pid, 0) on the original PPID is unreliable: after many restarts
 // the OS may have reassigned that PID number to a completely different, new
@@ -67,12 +67,12 @@ process.on('disconnect', () => shutdown('IPC-Kanal getrennt'))
 const parentPid = process.ppid
 setInterval(() => {
   if (process.ppid !== parentPid) {
-    shutdown('Eltern-Prozess nicht mehr erreichbar (reparented)')
+    shutdown('Parent process no longer reachable (reparented)')
   }
 }, 3000)
 
 function shutdown(reason) {
-  logErr(`Beende Worker (${reason})`)
+  logErr(`Shutting down worker (${reason})`)
   try { uIOhook.stop() } catch { /* already stopped */ }
   process.exit(0)
 }
@@ -83,10 +83,10 @@ function shutdown(reason) {
 setTimeout(() => {
   try {
     uIOhook.start()
-    log('uIOhook gestartet')
+    log('uIOhook started')
     process.send({ type: 'started' })
   } catch (err) {
-    logErr('Start fehlgeschlagen:', err.message)
+    logErr('Start failed:', err.message)
     process.send({ type: 'error', message: err.message })
   }
 }, 300)
