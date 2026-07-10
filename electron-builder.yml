@@ -18,9 +18,9 @@ files:
   - "!node_modules/electron-builder/**"
 
 asar: true
-# Native Module müssen aus dem asar-Archiv ausgepackt werden, sonst findet
-# der Loader die *.node/*.dylib-Binaries im gepackten Build nicht (App startet
-# lokal via `npm start`, aber die .dmg-Version lädt die Module nicht).
+# Native modules must be unpacked from the asar archive, otherwise the loader
+# can't find the *.node/*.dylib binaries in the packaged build (the app starts
+# locally via `npm start`, but the .dmg version fails to load the modules).
 asarUnpack:
   - "**/node_modules/@mukea/uiohook-napi/**"
   - "**/node_modules/@nut-tree-fork/**"

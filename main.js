@@ -5,7 +5,7 @@ const { fork } = require('child_process')
 
 const isDev = process.env.NODE_ENV === 'development'
 
-// EPIPE (z.B. wenn Terminal geschlossen wird) nicht crashen lassen
+// Don't crash on EPIPE (e.g. when the terminal is closed)
 process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
 process.stderr.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
 
@@ -13,18 +13,18 @@ function log(...args) {
   try {
     const ts = new Date().toISOString().slice(11, 23)
     console.log(`[${ts}]`, ...args)
-  } catch { /* EPIPE ignorieren */ }
+  } catch { /* ignore EPIPE */ }
 }
 
 function logErr(...args) {
   try {
     const ts = new Date().toISOString().slice(11, 23)
     console.error(`[${ts}] ❌`, ...args)
-  } catch { /* EPIPE ignorieren */ }
+  } catch { /* ignore EPIPE */ }
 }
 
-// electron-store ist ab v9 ESM-only, main.js ist CommonJS -> dynamisch
-// importieren, sobald die App bereit ist (siehe app.whenReady())
+// electron-store is ESM-only since v9, main.js is CommonJS -> import it
+// dynamically once the app is ready (see app.whenReady())
 let store = null
 
 let tray = null
@@ -32,18 +32,18 @@ let overlayWindow = null
 let settingsWindow = null
 let whisperPipeline = null
 let isLoadingModel = false
-let loadGeneration = 0         // verhindert, dass ein überholter Ladevorgang State überschreibt
-let hotkeyWorker = null        // aktueller Child-Process (siehe hotkey-worker.js)
-let hotkeyHolding = false      // Crash-Recovery: läuft gerade eine Aufnahme?
+let loadGeneration = 0         // prevents a superseded load from overwriting state
+let hotkeyWorker = null        // current child process (see hotkey-worker.js)
+let hotkeyHolding = false      // crash recovery: is a recording in progress?
 let hotkeyRespawnCount = 0
 let hotkeyStableTimer = null
-let hotkeyDisabled = false     // Circuit-Breaker ausgelöst -> kein weiterer Respawn
+let hotkeyDisabled = false     // circuit breaker tripped -> no further respawn
 let isQuitting = false
-// Xenova-Modellnamen (public, kein HF-Token nötig)
+// Xenova model names (public, no HF token needed)
 const MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 const MODEL_LABELS = { tiny: 'tiny (75 MB)', base: 'base (150 MB)', small: 'small (450 MB)', medium: 'medium (1.5 GB)', large: 'large (3 GB)' }
-// onnx-community hostet nur tiny/base/small - medium/large existieren dort
-// nicht (404 beim Download). Xenova hat alle 5 Größen.
+// onnx-community only hosts tiny/base/small - medium/large don't exist there
+// (404 on download). Xenova has all 5 sizes.
 const PROVIDER_MODELS = {
   Xenova: MODELS,
   'onnx-community': ['tiny', 'base', 'small'],
@@ -91,7 +91,7 @@ function createOverlay() {
 
 // ── Whisper ───────────────────────────────────────────────────────────────────
 
-// Cache im Home-Verzeichnis, nicht in node_modules
+// Cache in the home directory, not in node_modules
 const MODEL_CACHE_DIR = path.join(app.getPath('userData'), 'model-cache')
 
 function sendToSettings(data) {
@@ -100,10 +100,10 @@ function sendToSettings(data) {
   }
 }
 
-// Ladefortschritt ist sonst nur im Tray-Tooltip (leicht übersehen) oder im
-// Settings-Fenster (nur sichtbar wenn offen) zu sehen - zusätzlich im
-// Overlay-Pill zeigen, das immer verfügbar ist, unabhängig davon wodurch
-// der Download ausgelöst wurde (Start, Tray-Menü, Settings).
+// Otherwise the load progress is only visible in the tray tooltip (easily
+// missed) or the settings window (only when open) - also show it in the
+// overlay pill, which is always available, regardless of what triggered the
+// download (startup, tray menu, settings).
 let lastModelProgress = null
 function sendModelProgress(data) {
   lastModelProgress = data
@@ -111,11 +111,10 @@ function sendModelProgress(data) {
   overlayWindow?.webContents.send('model-loading', data)
 }
 
-// Overlay lädt in einem eigenen Renderer-Prozess und ist beim App-Start
-// evtl. noch nicht fertig geladen, wenn die ersten Fortschritts-Events
-// feuern - die gingen dann ersatzlos verloren (Electron puffert nicht).
-// Renderer meldet sich hier, sobald er wirklich zuhört, und bekommt den
-// zu dem Zeitpunkt aktuellen Stand nachgereicht.
+// The overlay loads in its own renderer process and may not be fully loaded
+// at app start when the first progress events fire - those would then be lost
+// (Electron doesn't buffer). The renderer reports in here as soon as it's
+// actually listening, and gets the state current at that moment replayed.
 ipcMain.on('overlay-ready', () => {
   if (lastModelProgress) overlayWindow?.webContents.send('model-loading', lastModelProgress)
 })
@@ -125,10 +124,10 @@ async function loadModel(modelName, force = false) {
     log('loadModel: bereits am Laden, übersprungen')
     return
   }
-  // Jeder Aufruf bekommt eine eigene Generation. Startet ein force-Reload
-  // (z.B. Provider-Wechsel) während noch ein Ladevorgang läuft, erkennt der
-  // ältere nach seinem await, dass er überholt wurde, und verwirft sein
-  // Ergebnis, statt frisch geladenen State zu überschreiben.
+  // Every call gets its own generation. If a forced reload (e.g. provider
+  // change) starts while a load is still running, the older one detects after
+  // its await that it was superseded and discards its result instead of
+  // overwriting freshly loaded state.
   const myGen = ++loadGeneration
   isLoadingModel = true
   updateTrayLabel(`Lade ${modelName}…`)
@@ -140,8 +139,8 @@ async function loadModel(modelName, force = false) {
     env.cacheDir = MODEL_CACHE_DIR
     const hfToken = getHfToken()
     if (hfToken) {
-      // ab transformers.js v4 kein env.authToken mehr, stattdessen eigener
-      // fetch-Wrapper der den Authorization-Header setzt
+      // since transformers.js v4 there's no env.authToken anymore, instead a
+      // custom fetch wrapper that sets the Authorization header
       env.fetch = (url, options) => fetch(url, {
         ...options,
         headers: { ...options?.headers, Authorization: `Bearer ${hfToken}` },
@@ -154,12 +153,12 @@ async function loadModel(modelName, force = false) {
     log(`Lade Modell: ${modelId}`)
     log(`Cache-Dir:   ${MODEL_CACHE_DIR}`)
 
-    // Logging drosseln: pro Datei nur bei ganzen 10%-Schritten
+    // Throttle logging: per file only at whole 10% steps
     const lastLoggedPct = {}
-    // Mehrere .onnx-Teile (encoder/decoder) laden parallel - würde man pro
-    // Datei einzeln an die UI weiterreichen, springt der Balken zwischen
-    // unterschiedlichen Datei-Prozentwerten hin und her. Stattdessen über
-    // Bytes aller Dateien aggregieren -> ein einziger, ruhiger Gesamtwert.
+    // Multiple .onnx parts (encoder/decoder) load in parallel - passing each
+    // file's percentage to the UI individually would make the bar jump back
+    // and forth between different per-file values. Instead aggregate over the
+    // bytes of all files -> a single, steady overall value.
     const fileBytes = {}
     let lastSentPct = -1
     const progress_callback = (data) => {
@@ -172,25 +171,23 @@ async function loadModel(modelName, force = false) {
           log(`Download [${file}] ${step}%`)
         }
 
-        // Tokenizer/Config-Dateien (auch tokenizer.json, das je nach Modell
-        // mehrere MB groß sein kann) laden komplett durch, bevor die
-        // eigentlichen Modell-Gewichte (die Minuten dauern können) überhaupt
-        // anfangen. Ein Größen-Schwellwert reicht nicht, da tokenizer.json
-        // teils größer als die Gewichte eines "tiny"-Modells ist. Deshalb nur
-        // Dateien zählen, die ".onnx" im Namen enthalten - das deckt sowohl
-        // "encoder_model.onnx" als auch die bei größeren Modellen ausgelagerte
-        // "encoder_model.onnx_data" ab (ONNX external data, ab ~2GB Protobuf-
-        // Limit nötig; "endsWith('.onnx')" matcht die _data-Variante nicht).
+        // Tokenizer/config files (including tokenizer.json, which depending on
+        // the model can be several MB) load completely before the actual model
+        // weights (which can take minutes) even start. A size threshold isn't
+        // enough, since tokenizer.json is sometimes larger than the weights of
+        // a "tiny" model. So only count files that contain ".onnx" in the name
+        // - that covers both "encoder_model.onnx" and, for larger models, the
+        // externalized "encoder_model.onnx_data" (ONNX external data, needed
+        // above the ~2GB protobuf limit; "endsWith('.onnx')" wouldn't match the
+        // _data variant).
         //
-        // Aber selbst innerhalb der .onnx-Dateien gibt es das gleiche Problem
-        // nochmal: die kleine "*.onnx"-Graphdatei (ein paar KB-MB) lädt oft in
-        // einem einzigen Event sofort komplett, BEVOR die riesige zugehörige
-        // "*.onnx_data"-Gewichtsdatei überhaupt anfängt - und friert die
-        // Monoton-Sperre unten fälschlich bei 100% ein. Deshalb zusätzlich:
-        // nur Dateien zählen, die wir schon mit <100% gesehen haben oder die
-        // wir schon verfolgen (schließt sofort-komplette Dateien beim ersten
-        // Auftreten aus, ohne spätere Updates einer bereits laufenden Datei
-        // zu verpassen).
+        // But even within the .onnx files the same problem recurs: the small
+        // "*.onnx" graph file (a few KB-MB) often loads completely in a single
+        // event, BEFORE the huge associated "*.onnx_data" weights file even
+        // starts - and would falsely freeze the monotonic lock below at 100%.
+        // So additionally: only count files we've already seen at <100% or are
+        // already tracking (excludes instantly-complete files on first
+        // appearance, without missing later updates of an already-running file).
         if (file.includes('.onnx') && (pct < 100 || fileBytes[file] !== undefined)) {
           fileBytes[file] = { loaded: data.loaded || 0, total: data.total || 0 }
         }
@@ -198,18 +195,18 @@ async function loadModel(modelName, force = false) {
           (acc, f) => ({ loaded: acc.loaded + f.loaded, total: acc.total + f.total }),
           { loaded: 0, total: 0 }
         )
-        // totals.total === 0 heißt: noch keine .onnx-Datei gesehen, nur
-        // Metadaten - dann noch keinen Fortschritt zeigen.
+        // totals.total === 0 means: no .onnx file seen yet, only metadata -
+        // so don't show any progress yet.
         if (totals.total === 0) return
         const rawPct = Math.round((totals.loaded / totals.total) * 100)
-        // Sobald eine weitere (große) Datei zu laden beginnt, fließt ihre
-        // Gesamtgröße sofort in den Nenner ein, während ihr geladener Anteil
-        // noch bei 0 liegt -> der Gesamtwert kann kurz zurückspringen. Nie
-        // rückwärts anzeigen, das sähe wie ein Fehler aus.
+        // As soon as another (large) file starts loading, its total size
+        // immediately enters the denominator while its loaded portion is still
+        // 0 -> the overall value can briefly jump back. Never display
+        // backwards, that would look like an error.
         const overallPct = Math.max(rawPct, lastSentPct)
         updateTrayLabel(`${modelName} ${overallPct}%`)
 
-        // Nur bei tatsächlicher Prozent-Änderung senden, sonst flackert die UI
+        // Only send on an actual percentage change, otherwise the UI flickers
         if (overallPct !== lastSentPct) {
           lastSentPct = overallPct
           sendModelProgress({ status: 'progress', progress: overallPct })
@@ -219,25 +216,25 @@ async function loadModel(modelName, force = false) {
       }
     }
 
-    // Geräte-/dtype-Historie (siehe PLAN.md-Vorgeschichte):
-    // - CoreML + fp32 + Standard-Speicher-Allokator: hängt/stürzt bei der
-    //   Inferenz mit echter Sprache und größeren Modellen (medium/large).
-    // - CPU + fp32 + Standard-Allokator: gleiches Bild - onnxruntimes
-    //   BFCArena-Speicherpool-Allokator crasht (posix_memalign) beim
-    //   Extend, reproduzierbar mit echten Audiodaten, aber NUR im echten
-    //   Electron-Prozess (deutlich höherer Speicher-Fußabdruck durch
-    //   GPU-Prozess/Compositor) - nie in einem isolierten Node-Skript.
-    // - fp16 (CoreML und CPU gleichermaßen): scheitert schon beim Laden
-    //   mit einem ONNX-Graph-Fehler (LayerNorm-Fusion/
-    //   InsertedPrecisionFreeCast) - die fp16-Datei selbst ist mit dieser
-    //   onnxruntime-Version inkompatibel, unabhängig vom Gerät.
-    // - `session_options: { enableCpuMemArena: false }` deaktiviert den
-    //   fehlerhaften Pool-Allokator (normales malloc/free statt Pooling) -
-    //   behebt den Crash vollständig. Damit läuft CoreML + fp32 (beste
-    //   Qualität + Apple-Silicon-GPU/Neural-Engine) zuverlässig - mit
-    //   denselben echten Audiodaten 3x hintereinander verifiziert.
-    //   CoreML + q8 stürzt weiterhin (Quantisierung + CoreML verträgt sich
-    //   nicht), daher fp32 statt q8 für den CoreML-Pfad.
+    // Device/dtype history (see PLAN.md background):
+    // - CoreML + fp32 + default memory allocator: hangs/crashes during
+    //   inference with real speech and larger models (medium/large).
+    // - CPU + fp32 + default allocator: same picture - onnxruntime's
+    //   BFCArena memory-pool allocator crashes (posix_memalign) on extend,
+    //   reproducible with real audio data, but ONLY in the real Electron
+    //   process (much higher memory footprint due to the GPU
+    //   process/compositor) - never in an isolated Node script.
+    // - fp16 (CoreML and CPU alike): already fails at load time with an
+    //   ONNX graph error (LayerNorm fusion/InsertedPrecisionFreeCast) - the
+    //   fp16 file itself is incompatible with this onnxruntime version,
+    //   regardless of device.
+    // - `session_options: { enableCpuMemArena: false }` disables the buggy
+    //   pool allocator (plain malloc/free instead of pooling) - fixes the
+    //   crash completely. With that, CoreML + fp32 (best quality + Apple
+    //   Silicon GPU/Neural Engine) runs reliably - verified 3 times in a row
+    //   with the same real audio data. CoreML + q8 still crashes
+    //   (quantization + CoreML don't get along), so fp32 instead of q8 for
+    //   the CoreML path.
     const preferredDevice = process.platform === 'darwin' ? 'coreml' : 'cpu'
     let pipe
     try {
@@ -255,8 +252,8 @@ async function loadModel(modelName, force = false) {
         { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback }
       )
     }
-    // Zwischenzeitlich durch einen neueren Ladevorgang überholt? Dann Ergebnis
-    // verwerfen, damit wir nicht das gerade frisch geladene Modell überschreiben.
+    // Superseded by a newer load in the meantime? Then discard the result, so
+    // we don't overwrite the model that was just freshly loaded.
     if (myGen !== loadGeneration) {
       log(`loadModel: ${modelId} wurde überholt, Ergebnis verworfen`)
       return
@@ -269,8 +266,8 @@ async function loadModel(modelName, force = false) {
     sendModelProgress({ status: 'ready' })
     setTimeout(() => overlayWindow?.hide(), 500)
   } catch (err) {
-    // Überholter Ladevorgang: Fehler gehört nicht mehr zum aktiven Modell,
-    // still verwerfen (der neuere Ladevorgang besitzt den State jetzt).
+    // Superseded load: the error no longer belongs to the active model,
+    // discard it silently (the newer load owns the state now).
     if (myGen !== loadGeneration) {
       log(`loadModel: überholter Ladevorgang mit Fehler verworfen (${err.message})`)
       return
@@ -278,7 +275,7 @@ async function loadModel(modelName, force = false) {
     logErr('Model load error:', err.message)
     updateTrayLabel('Fehler beim Laden')
 
-    // Korrupten Cache löschen damit beim nächsten Versuch frisch geladen wird
+    // Delete the corrupt cache so the next attempt downloads fresh
     const provider    = store.get('provider', 'Xenova')
     const corruptPath = path.join(MODEL_CACHE_DIR, provider, `whisper-${modelName}`)
     if (fs.existsSync(corruptPath)) {
@@ -289,9 +286,9 @@ async function loadModel(modelName, force = false) {
     sendModelProgress({ status: 'error', message: err.message })
     overlayWindow?.hide()
 
-    // Tray-Tooltip allein wird leicht übersehen (z.B. bei Auswahl über das
-    // Tray-Menü statt über die Settings) - Dialog nur zeigen, wenn die
-    // Settings gerade NICHT offen sind (die zeigen den Fehler schon selbst).
+    // The tray tooltip alone is easily missed (e.g. when selecting via the
+    // tray menu instead of the settings) - only show a dialog when the
+    // settings are NOT currently open (they show the error themselves).
     if (!settingsWindow || settingsWindow.isDestroyed()) {
       dialog.showErrorBox(
         'Modell konnte nicht geladen werden',
@@ -299,8 +296,8 @@ async function loadModel(modelName, force = false) {
       )
     }
   } finally {
-    // Nur zurücksetzen, wenn kein neuerer Ladevorgang die Führung übernommen
-    // hat - sonst würde ein überholter Alt-Lauf das Flag des aktiven löschen.
+    // Only reset if no newer load has taken over - otherwise a superseded old
+    // run would clear the active one's flag.
     if (myGen === loadGeneration) isLoadingModel = false
   }
 }
@@ -311,19 +308,19 @@ async function transcribe(pcm) {
   const genOptions = {
     language: 'german',
     task: 'transcribe',
-    // Whisper verarbeitet intern nur ein festes 30s-Fenster - ohne Chunking
-    // wird alles danach stillschweigend abgeschnitten. chunk_length_s aktiviert
-    // Long-Form-Transkription (überlappende 30s-Fenster werden zusammengefügt).
+    // Whisper internally processes only a fixed 30s window - without chunking
+    // everything after that is silently cut off. chunk_length_s enables
+    // long-form transcription (overlapping 30s windows are stitched together).
     chunk_length_s: 30,
     stride_length_s: 5,
-    // max_new_tokens als Sicherheitsnetz gegen Wiederholungsschleifen, ein
-    // bekanntes Whisper-Fehlerbild bei Stille/Rauschen/unklarer Sprache.
+    // max_new_tokens as a safety net against repetition loops, a known Whisper
+    // failure mode on silence/noise/unclear speech.
     max_new_tokens: 440,
   }
 
-  // Verbose Diagnostik (PCM-Eckdaten + Live-Token-Streamer) nur im Dev-Modus:
-  // im Produktivbetrieb ist das reine Log-Flut und würde u.a. den erkannten
-  // Text tokenweise mitschreiben (Datenschutz bei einer Diktat-App).
+  // Verbose diagnostics (PCM stats + live token streamer) only in dev mode:
+  // in production this is pure log noise and would, among other things, write
+  // the recognized text token by token (privacy for a dictation app).
   if (isDev) {
     let min = Infinity, max = -Infinity, sumAbs = 0
     for (let i = 0; i < pcm.length; i++) {
@@ -359,13 +356,13 @@ async function transcribe(pcm) {
   return result.text.trim()
 }
 
-// ── HF-Token (verschlüsselt über die OS-Keychain) ──────────────────────────────
-// Den HuggingFace-Token nicht im Klartext in der electron-store-JSON ablegen.
-// safeStorage nutzt die System-Keychain (macOS) bzw. DPAPI (Windows). Ist
-// Verschlüsselung nicht verfügbar (z.B. Linux ohne Keyring), Fallback auf
-// Klartext, damit die Funktion nicht komplett ausfällt.
+// ── HF token (encrypted via the OS keychain) ───────────────────────────────────
+// Don't store the HuggingFace token in plaintext in the electron-store JSON.
+// safeStorage uses the system keychain (macOS) / DPAPI (Windows). If
+// encryption isn't available (e.g. Linux without a keyring), fall back to
+// plaintext so the feature doesn't fail entirely.
 function setHfToken(token) {
-  store.delete('hfToken') // evtl. alten Klartext-Wert entfernen (Migration)
+  store.delete('hfToken') // remove any old plaintext value (migration)
   if (!token) { store.delete('hfTokenEnc'); return }
   if (safeStorage.isEncryptionAvailable()) {
     store.set('hfTokenEnc', safeStorage.encryptString(token).toString('base64'))
@@ -384,7 +381,7 @@ function getHfToken() {
       return ''
     }
   }
-  return store.get('hfToken', '') // Fallback / Migration von altem Klartext
+  return store.get('hfToken', '') // fallback / migration from old plaintext
 }
 
 // ── Settings Window ──────────────────────────────────────────────────────────
@@ -416,9 +413,9 @@ ipcMain.handle('settings-get', () => ({
   hfToken:  getHfToken(),
 }))
 
-// Externen Link öffnen (HF-Token-Seite aus den Settings). Eigener Kanal statt
-// über settings-save gemischt; nur https zulassen, damit kein beliebiges
-// Schema (file://, etc.) aus dem Renderer geöffnet werden kann.
+// Open an external link (the HF token page from the settings). A dedicated
+// channel instead of mixing it into settings-save; only allow https so no
+// arbitrary scheme (file://, etc.) can be opened from the renderer.
 ipcMain.on('shell-open', (_e, url) => {
   if (typeof url === 'string' && /^https:\/\//i.test(url)) shell.openExternal(url)
 })
@@ -428,20 +425,20 @@ ipcMain.handle('settings-save', async (_e, data) => {
   store.set('provider', data.provider)
   setHfToken(data.hfToken)
 
-  // Modell mit neuen Settings neu laden. force=true umgeht die "lädt bereits"-
-  // Sperre; ein evtl. noch laufender Ladevorgang wird über die loadGeneration
-  // sauber verworfen (kein manuelles isLoadingModel-Zurücksetzen mehr nötig,
-  // das war zuvor die Race-Ursache). whisperPipeline auf null, damit während
-  // des Reloads nicht mit dem alten Modell transkribiert wird.
+  // Reload the model with the new settings. force=true bypasses the "already
+  // loading" guard; any still-running load is discarded cleanly via the
+  // loadGeneration (no manual isLoadingModel reset needed anymore, that was
+  // previously the cause of the race). whisperPipeline set to null so we don't
+  // transcribe with the old model during the reload.
   whisperPipeline = null
   const currentModel = store.get('model', 'small')
   await loadModel(currentModel, true)
 })
 
-// ── Modell-Cache ───────────────────────────────────────────────────────────────
-// Gecachte Modelle liegen als `<provider>/whisper-<model>/`-Ordner unter
-// MODEL_CACHE_DIR (siehe env.cacheDir in loadModel). Größe pro Ordner ermitteln
-// und Löschen ermöglichen, damit große Modelle nicht unbemerkt die Platte füllen.
+// ── Model cache ────────────────────────────────────────────────────────────────
+// Cached models live as `<provider>/whisper-<model>/` folders under
+// MODEL_CACHE_DIR (see env.cacheDir in loadModel). Determine the size per
+// folder and allow deletion so large models don't silently fill the disk.
 
 function getDirSize(dir) {
   let total = 0
@@ -452,14 +449,14 @@ function getDirSize(dir) {
     try {
       if (entry.isDirectory()) total += getDirSize(full)
       else total += fs.statSync(full).size
-    } catch { /* Datei zwischenzeitlich weg - überspringen */ }
+    } catch { /* file gone in the meantime - skip */ }
   }
   return total
 }
 
-// true, wenn dieses Modell gerade im RAM geladen ist oder gerade lädt - dann
-// nicht löschbar (würde einen Neu-Download beim nächsten Diktat erzwingen bzw.
-// einen laufenden Download beschädigen).
+// true if this model is currently loaded in RAM or loading - then not
+// deletable (would force a re-download on the next dictation, or corrupt an
+// in-progress download).
 function isModelLocked(provider, model) {
   return provider === store.get('provider', 'Xenova') &&
          model === store.get('model', 'small') &&
@@ -500,9 +497,9 @@ function cacheSnapshot() {
   }
 }
 
-// Renderer-Eingaben nie ungeprüft in einen Pfad stecken: nur einfache Namen
-// zulassen und sicherstellen, dass der aufgelöste Pfad wirklich innerhalb von
-// MODEL_CACHE_DIR liegt (kein `..`-Traversal).
+// Never put renderer input into a path unchecked: only allow simple names and
+// make sure the resolved path really lies within MODEL_CACHE_DIR (no `..`
+// traversal).
 function safeModelDir(provider, model) {
   const NAME = /^[\w.-]+$/
   if (!NAME.test(provider || '') || !NAME.test(model || '')) return null
@@ -530,7 +527,7 @@ ipcMain.handle('cache-delete', (_e, { provider, model } = {}) => {
 
 ipcMain.handle('cache-clear-all', () => {
   for (const m of listCachedModels()) {
-    if (m.locked) continue // aktives Modell behalten
+    if (m.locked) continue // keep the active model
     const dir = safeModelDir(m.provider, m.model)
     if (dir && fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -541,7 +538,7 @@ ipcMain.handle('cache-clear-all', () => {
 })
 
 ipcMain.on('cache-open', () => {
-  try { fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true }) } catch { /* existiert schon */ }
+  try { fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true }) } catch { /* already exists */ }
   shell.openPath(MODEL_CACHE_DIR)
 })
 
@@ -554,18 +551,18 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
   let text = ''
   try {
     text = await transcribe(Float32Array.from(pcm))
-    // Erkannten Text nur im Dev-Modus loggen (Datenschutz bei Diktat).
+    // Only log the recognized text in dev mode (privacy for dictation).
     log(isDev ? `Transkription: "${text}"` : `Transkription fertig (${text.length} Zeichen)`)
   } catch (err) {
     logErr('Transkriptionsfehler:', err.message)
   }
 
   if (text) {
-    // Alten Clipboard-Inhalt retten
+    // Save the old clipboard content
     const prev = clipboard.readText()
     clipboard.writeText(text)
 
-    // Fenster kurz focussieren lassen dann paste simulieren
+    // Briefly let the window lose focus, then simulate paste
     overlayWindow?.hide()
     await new Promise(r => setTimeout(r, 80))
 
@@ -579,7 +576,7 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
       await keyboard.releaseKey(Key.LeftControl, Key.V)
     }
 
-    // Clipboard wiederherstellen nach kurzem Delay
+    // Restore the clipboard after a short delay
     setTimeout(() => clipboard.writeText(prev), 500)
   }
 
@@ -587,15 +584,15 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
   setTimeout(() => overlayWindow?.hide(), 700)
 })
 
-// Renderer meldet, dass die Aufnahme nicht starten konnte (z.B. Mikrofon-
-// Berechtigung verweigert). Overlay/Tray zurücksetzen und den Worker-Toggle
-// resetten, sonst bleibt der Zustand hängen (nächster ⌥Space nur Resync).
+// Renderer reports that recording couldn't start (e.g. microphone permission
+// denied). Reset overlay/tray and the worker toggle, otherwise the state stays
+// stuck (the next ⌥Space would only resync).
 ipcMain.on('recording-failed', (_e, message) => {
   logErr('Aufnahme fehlgeschlagen (Renderer):', message)
   hotkeyHolding = false
   setTrayRecording(false)
   overlayWindow?.hide()
-  try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* Kanal evtl. schon zu */ }
+  try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
   if (!settingsWindow || settingsWindow.isDestroyed()) {
     dialog.showErrorBox(
       'Mikrofon nicht verfügbar',
@@ -657,7 +654,7 @@ function setTrayRecording(recording) {
 // ── Hotkey (Push-to-Talk) ─────────────────────────────────────────────────────
 
 function setupHotkey() {
-  // Accessibility-Permission prüfen (macOS). Ohne diese kein globales keyup/keydown.
+  // Check the accessibility permission (macOS). Without it there's no global keyup/keydown.
   if (process.platform === 'darwin') {
     const trusted = systemPreferences.isTrustedAccessibilityClient(false)
     log('Accessibility-Check (Hauptprozess):', trusted)
@@ -668,7 +665,7 @@ function setupHotkey() {
         message: 'SHOWhisper benötigt Zugriff auf Bedienungshilfen für den globalen Hotkey.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
         buttons: ['Öffnen'],
       })
-      // Löst macOS-Prompt aus
+      // Triggers the macOS prompt
       systemPreferences.isTrustedAccessibilityClient(true)
       app.quit()
       return
@@ -678,10 +675,10 @@ function setupHotkey() {
   spawnHotkeyWorker()
 }
 
-// uiohook-napi hat einen bekannten, ungefixten Fatal-Error-Bug
-// (SnosMe/uiohook-napi#50), der den ganzen Prozess ohne Vorwarnung beendet.
-// Läuft deshalb isoliert in einem eigenen Kindprozess (hotkey-worker.js) -
-// stirbt der, sterben nicht Tray/Overlay/das geladene Whisper-Modell mit.
+// uiohook-napi has a known, unfixed fatal-error bug (SnosMe/uiohook-napi#50)
+// that terminates the whole process without warning. So it runs isolated in
+// its own child process (hotkey-worker.js) - if that dies, the tray/overlay/
+// the loaded Whisper model don't die with it.
 const HOTKEY_BACKOFF_MS = [500, 1000, 2000, 4000, 8000]
 const HOTKEY_MAX_RESPAWNS = HOTKEY_BACKOFF_MS.length
 
@@ -696,14 +693,14 @@ function spawnHotkeyWorker() {
     if (msg?.type === 'started') {
       log('Hotkey-Worker bereit, PID', hotkeyWorker.pid)
     } else if (msg?.type === 'start-recording') {
-      // Solange das Modell noch lädt, ist whisperPipeline entweder null oder
-      // wird gerade neu zugewiesen - keine Aufnahme starten, sonst geht der
-      // Ton verloren bzw. transcribe() findet kein Modell.
+      // While the model is still loading, whisperPipeline is either null or
+      // being reassigned - don't start recording, otherwise the audio is lost
+      // or transcribe() finds no model.
       if (isLoadingModel) {
         log('Aufnahme ignoriert: Modell lädt noch')
-        // Worker hat intern schon auf "recording" umgeschaltet - zurücksetzen,
-        // sonst braucht der nächste Tastendruck nur zum Resync (wirkungslos).
-        try { hotkeyWorker.send({ type: 'reset' }) } catch { /* Kanal evtl. schon zu */ }
+        // The worker already switched to "recording" internally - reset it,
+        // otherwise the next keypress is only spent resyncing (no effect).
+        try { hotkeyWorker.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
         return
       }
       hotkeyHolding = true
@@ -722,8 +719,8 @@ function spawnHotkeyWorker() {
   hotkeyWorker.on('exit', (code, signal) => handleHotkeyWorkerExit(code, signal))
   hotkeyWorker.on('error', (err) => logErr('Hotkey-Worker konnte nicht gestartet werden:', err.message))
 
-  // Nach stabiler Laufzeit Respawn-Zähler zurücksetzen, damit ein einzelner
-  // Crash nach langer fehlerfreier Laufzeit nicht sofort den Circuit-Breaker triggert.
+  // After a stable runtime, reset the respawn counter so that a single crash
+  // after a long error-free runtime doesn't immediately trip the circuit breaker.
   clearTimeout(hotkeyStableTimer)
   hotkeyStableTimer = setTimeout(() => { hotkeyRespawnCount = 0 }, 30000)
 }
@@ -732,7 +729,7 @@ function handleHotkeyWorkerExit(code, signal) {
   clearTimeout(hotkeyStableTimer)
   hotkeyWorker = null
 
-  // Mitten in einer gehaltenen Aufnahme abgestürzt -> Overlay/Tray nicht hängen lassen
+  // Crashed in the middle of a held recording -> don't leave overlay/tray hanging
   if (hotkeyHolding) {
     hotkeyHolding = false
     setTrayRecording(false)
@@ -740,7 +737,7 @@ function handleHotkeyWorkerExit(code, signal) {
     overlayWindow?.hide()
   }
 
-  if (isQuitting) return // gewollter Shutdown, kein Respawn
+  if (isQuitting) return // intentional shutdown, no respawn
 
   logErr(`Hotkey-Worker beendet (code=${code}, signal=${signal})`)
 
@@ -761,7 +758,7 @@ function handleHotkeyWorkerExit(code, signal) {
 app.commandLine.appendSwitch('disable-features', 'AutofillServerCommunication')
 
 app.whenReady().then(async () => {
-  app.dock?.hide() // Mac: kein Dock-Icon
+  app.dock?.hide() // Mac: no dock icon
 
   const { default: Store } = await import('electron-store')
   store = new Store()
@@ -773,19 +770,19 @@ app.whenReady().then(async () => {
   setupHotkey()
 
   let savedModel = store.get('model', 'small')
-  if (!MODELS.includes(savedModel)) savedModel = 'small' // Migration: large-v3 → large
+  if (!MODELS.includes(savedModel)) savedModel = 'small' // migration: large-v3 → large
   await loadModel(savedModel)
 })
 
-app.on('window-all-closed', (e) => e.preventDefault()) // Tray-App bleibt offen
+app.on('window-all-closed', (e) => e.preventDefault()) // tray app stays open
 
 app.on('before-quit', () => { isQuitting = true })
 
 app.on('will-quit', () => {
   if (hotkeyWorker) {
-    try { hotkeyWorker.send({ type: 'shutdown' }) } catch { /* Kanal evtl. schon zu */ }
-    // Fallback falls Worker nicht rechtzeitig sauber beendet
+    try { hotkeyWorker.send({ type: 'shutdown' }) } catch { /* channel may already be closed */ }
+    // Fallback in case the worker doesn't exit cleanly in time
     const w = hotkeyWorker
-    setTimeout(() => { try { w.kill() } catch { /* bereits beendet */ } }, 500)
+    setTimeout(() => { try { w.kill() } catch { /* already terminated */ } }, 500)
   }
 })

@@ -156,7 +156,7 @@
       margin-top: 5px;
     }
 
-    /* ── Modell-Cache ────────────────────────────────────────────────────── */
+    /* ── Model cache ─────────────────────────────────────────────────────── */
     .cache-header {
       display: flex;
       align-items: center;
@@ -293,7 +293,7 @@
       refreshCache()
     }
 
-    // ── Modell-Cache ──────────────────────────────────────────────────────────
+    // ── Model cache ───────────────────────────────────────────────────────────
     function formatBytes(n) {
       if (!n) return '0 MB'
       const gb = n / 1e9
@@ -357,8 +357,8 @@
     })
 
     function openHF() {
-      // shell.openExternal ist im Renderer ohne nodeIntegration nicht verfügbar
-      // -> über den dedizierten shell-open-Kanal im Main-Prozess öffnen
+      // shell.openExternal isn't available in the renderer without nodeIntegration
+      // -> open it via the dedicated shell-open channel in the main process
       window.settings.openExternal('https://huggingface.co/settings/tokens')
     }
 
@@ -390,7 +390,7 @@
         fill.style.width   = '100%'
         pct.textContent    = '100%'
         status.textContent = '✓ Modell geladen'
-        refreshCache() // frisch geladenes Modell in der Cache-Liste zeigen
+        refreshCache() // show the freshly loaded model in the cache list
         setTimeout(() => window.close(), 900)
       }
 

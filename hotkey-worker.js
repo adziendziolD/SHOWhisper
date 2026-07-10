@@ -1,37 +1,37 @@
-// hotkey-worker.js – läuft als eigener Node-Prozess (ELECTRON_RUN_AS_NODE),
-// isoliert vom Hauptprozess. Nutzt @mukea/uiohook-napi (aktiv gepflegter
-// Fork von SnosMe/uiohook-napi) statt des Originals: Letzteres hat einen
-// ungefixten N-API Fatal Error (SnosMe/uiohook-napi#50) und liefert auf
-// aktuellem macOS/Electron nach dem ersten Tastendruck gar keine Events
-// mehr (CGEventTap wird von macOS deaktiviert und nie wieder aktiviert).
-// Isoliert in diesem Worker reißt ein Absturz trotzdem nicht Tray/Overlay/
-// das geladene Whisper-Modell im Hauptprozess mit.
+// hotkey-worker.js – runs as its own Node process (ELECTRON_RUN_AS_NODE),
+// isolated from the main process. Uses @mukea/uiohook-napi (an actively
+// maintained fork of SnosMe/uiohook-napi) instead of the original: the latter
+// has an unfixed N-API fatal error (SnosMe/uiohook-napi#50) and, on current
+// macOS/Electron, stops delivering any events after the first keypress
+// (macOS disables the CGEventTap and never re-enables it). Isolated in this
+// worker, a crash still doesn't take the tray/overlay/the loaded Whisper
+// model in the main process down with it.
 
 function log(...args) {
   try {
     const ts = new Date().toISOString().slice(11, 23)
     console.log(`[${ts}] [hotkey]`, ...args)
-  } catch { /* EPIPE ignorieren */ }
+  } catch { /* ignore EPIPE */ }
 }
 
 function logErr(...args) {
   try {
     const ts = new Date().toISOString().slice(11, 23)
     console.error(`[${ts}] [hotkey] ❌`, ...args)
-  } catch { /* EPIPE ignorieren */ }
+  } catch { /* ignore EPIPE */ }
 }
 
 const { UiohookKey, uIOhook } = require('@mukea/uiohook-napi')
 
-// Toggle statt Push-to-Talk: ⌥Space startet die Aufnahme, ⌥Space (nochmal
-// drücken) stoppt sie wieder. isDown dient nur der Entprellung, damit
-// OS-Key-Repeat (mehrere keydown-Events bei gehaltener Taste) nicht mehrfach
-// togglet - der eigentliche Toggle passiert ausschließlich bei keydown.
+// Toggle instead of push-to-talk: ⌥Space starts recording, ⌥Space (pressed
+// again) stops it. isDown is only for debouncing, so OS key-repeat (multiple
+// keydown events while the key is held) doesn't toggle repeatedly - the actual
+// toggle happens exclusively on keydown.
 let isDown = false
 let isRecording = false
 
 uIOhook.on('keydown', (e) => {
-  // ALT + SPACE = uiohook keycode für Space (57) mit alt-flag
+  // ALT + SPACE = uiohook keycode for Space (57) with alt flag
   if (e.keycode === UiohookKey.Space && e.altKey && !isDown) {
     isDown = true
     isRecording = !isRecording
@@ -47,23 +47,23 @@ uIOhook.on('keyup', (e) => {
 
 process.on('message', (msg) => {
   if (msg?.type === 'shutdown') shutdown('Shutdown angefordert')
-  // Hauptprozess hat einen start-recording abgelehnt (z.B. Modell lädt noch)
-  // - Toggle-Status zurücksetzen, sonst braucht der nächste Tastendruck nur
-  // zum Resync (wirkungslos für den Nutzer).
+  // main process rejected a start-recording (e.g. model still loading)
+  // - reset the toggle state, otherwise the next keypress is only spent
+  // resyncing (no effect for the user).
   else if (msg?.type === 'reset') isRecording = false
 })
 
-// Falls der Hauptprozess zuerst stirbt: nicht als Zombie weiterlaufen.
-// 'disconnect' allein reicht nicht - stirbt der Electron-Hauptprozess abrupt
-// (z.B. SIGTERM statt sauberem app.quit()), schließt sich der IPC-Kanal nicht
-// zuverlässig, daher zusätzlich Eltern-Prozess aktiv überwachen.
+// If the main process dies first: don't keep running as a zombie.
+// 'disconnect' alone isn't enough - if the Electron main process dies abruptly
+// (e.g. SIGTERM instead of a clean app.quit()), the IPC channel doesn't close
+// reliably, so additionally watch the parent process actively.
 process.on('disconnect', () => shutdown('IPC-Kanal getrennt'))
 
-// process.kill(pid, 0) auf die ursprüngliche PPID ist unzuverlässig: nach
-// vielen Neustarts kann diese PID-Nummer vom OS an einen völlig anderen,
-// neuen Prozess vergeben worden sein (PID-Reuse) - der Liveness-Check würde
-// dann fälschlich "Elternteil lebt noch" melden. process.ppid selbst ändert
-// sich beim Reparenting sofort auf 1 (launchd) - das ist der robuste Signal.
+// process.kill(pid, 0) on the original PPID is unreliable: after many restarts
+// the OS may have reassigned that PID number to a completely different, new
+// process (PID reuse) - the liveness check would then falsely report "parent
+// still alive". process.ppid itself changes to 1 (launchd) immediately on
+// reparenting - that's the robust signal.
 const parentPid = process.ppid
 setInterval(() => {
   if (process.ppid !== parentPid) {
@@ -73,13 +73,13 @@ setInterval(() => {
 
 function shutdown(reason) {
   logErr(`Beende Worker (${reason})`)
-  try { uIOhook.stop() } catch { /* bereits gestoppt */ }
+  try { uIOhook.stop() } catch { /* already stopped */ }
   process.exit(0)
 }
 
-// Kurze Verzögerung reduziert das Startup-Race-Risiko, siehe
-// SnosMe/uiohook-napi#50. Behebt den Bug nicht, aber die eigentliche
-// Absicherung ist jetzt die Prozess-Isolation selbst.
+// A short delay reduces the startup-race risk, see SnosMe/uiohook-napi#50.
+// It doesn't fix the bug, but the actual safeguard is now the process
+// isolation itself.
 setTimeout(() => {
   try {
     uIOhook.start()

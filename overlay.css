@@ -61,7 +61,7 @@ html, body {
   -webkit-app-region: drag;
 }
 
-/* Loading (Modell-Download) */
+/* Loading (model download) */
 #pill.loading {
   min-width: 300px;
   background: rgba(20, 70, 110, 0.88);

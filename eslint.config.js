@@ -1,7 +1,7 @@
-// ESLint flat config (ESLint 9+). Bewusst schlank gehalten: fängt echte Fehler
-// (undefinierte Variablen, tote Bindings) ohne Style-Nörgelei. Pro Dateigruppe
-// eigene Globals, da Main/Preload in Node und der Overlay-Renderer im Browser
-// laufen.
+// ESLint flat config (ESLint 9+). Deliberately minimal: catches real bugs
+// (undefined variables, dead bindings) without style nitpicking. Each file
+// group gets its own globals, since main/preload run in Node and the overlay
+// renderer runs in the browser.
 
 const nodeGlobals = {
   require: 'readonly', module: 'writable', exports: 'writable', process: 'readonly',

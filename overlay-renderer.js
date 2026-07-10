@@ -1,4 +1,4 @@
-/* Renderer – läuft im BrowserWindow (Overlay) */
+/* Renderer – runs in the BrowserWindow (overlay) */
 
 const pill        = document.getElementById('pill')
 const canvas      = document.getElementById('waveform')
@@ -21,7 +21,7 @@ function setState(state) {
   pill.className = state // 'loading' | 'recording' | 'transcribing' | 'done' | ''
 }
 
-// ── Modell-Ladevorgang ───────────────────────────────────────────────────────
+// ── Model loading ─────────────────────────────────────────────────────────────
 
 function handleModelLoading(data) {
   if (data.status === 'progress') {
@@ -61,7 +61,7 @@ function drawWaveform() {
   ctx.fillStyle = grad
 
   for (let i = 0; i < bars; i++) {
-    // Sample aus dem niedrigen Frequenzbereich (Stimme ~80-3000 Hz)
+    // Sample from the low frequency range (voice ~80-3000 Hz)
     const sampleIdx = Math.floor((i / bars) * (bufLen * 0.4))
     const norm      = data[sampleIdx] / 255
     const h         = Math.max(3, norm * maxH)
@@ -97,10 +97,10 @@ function stopTimer() {
 async function startRecording() {
   audioChunks = []
 
-  // Mikrofonzugriff kann scheitern (Berechtigung verweigert, kein Gerät). Ohne
-  // Fang bliebe die Pill sichtbar aber zustandslos hängen und Tray/Worker-Toggle
-  // desynchronisiert - stattdessen sauber abbrechen und den Main-Prozess das
-  // Recording-Fenster/Tray/den Worker-Toggle zurücksetzen lassen.
+  // Microphone access can fail (permission denied, no device). Without a
+  // catch, the pill would stay visible but stuck stateless and the tray/worker
+  // toggle desynced - instead abort cleanly and let the main process reset the
+  // recording window/tray/worker toggle.
   let stream
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -128,9 +128,9 @@ async function startRecording() {
 
 const WHISPER_SAMPLE_RATE = 16000
 
-// Whisper erwartet rohes Mono-PCM bei 16kHz. MediaRecorder liefert
-// WebM/Opus, das im Node-Hauptprozess (kein AudioContext!) nicht mehr
-// dekodiert werden kann - also hier im Renderer decodieren + resamplen.
+// Whisper expects raw mono PCM at 16kHz. MediaRecorder produces WebM/Opus,
+// which can't be decoded in the Node main process (no AudioContext!) - so
+// decode + resample here in the renderer.
 async function decodeToWhisperPCM(blob) {
   const arrayBuffer = await blob.arrayBuffer()
   const decodeCtx   = new AudioContext()
@@ -164,8 +164,8 @@ async function stopRecording() {
     mediaRecorder.stream.getTracks().forEach((t) => t.stop())
   })
 
-  // AudioContext schließen - Browser limitieren die Zahl offener Contexts
-  // (~6), sonst schlägt new AudioContext() nach einigen Aufnahmen fehl.
+  // Close the AudioContext - browsers cap the number of open contexts (~6),
+  // otherwise new AudioContext() fails after a few recordings.
   if (audioCtx) { audioCtx.close(); audioCtx = null }
   mediaRecorder = null
 
@@ -186,8 +186,8 @@ window.whisper.onTranscribing(()   => setState('transcribing'))
 window.whisper.onDone(()           => setState('done'))
 window.whisper.onModelLoading(handleModelLoading)
 
-// Meldet dem Hauptprozess, dass hier jetzt tatsächlich zugehört wird.
-// Ohne das können frühe model-loading-Events (App-Start, bevor diese Seite
-// fertig geladen ist) ins Leere laufen - Electron puffert nicht, ein noch
-// nicht lauschender Renderer verliert die Nachricht ersatzlos.
+// Tells the main process that we're actually listening now. Without this,
+// early model-loading events (app start, before this page has finished
+// loading) would be lost - Electron doesn't buffer; a renderer that isn't
+// listening yet drops the message entirely.
 window.whisper.overlayReady()
