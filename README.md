@@ -82,12 +82,19 @@ Output lands in `dist/` (`.dmg` on macOS, NSIS `.exe` on Windows). Native module
 
 ### Code signing & notarization (macOS)
 
-The build is **unsigned** by default. That's fine for local use, but on another Mac Gatekeeper will refuse to open it ("app is damaged / from an unidentified developer"). Recipients can right-click → Open, or run `xattr -cr SHOWhisper.app`.
+The build is **ad-hoc signed** (`mac.identity: "-"` in `electron-builder.yml`), which needs no Apple Developer account. This is what keeps Apple Silicon from rejecting the app with the hard "app is damaged" error. It is **not** notarized, so on first launch Gatekeeper still shows "SHOWhisper cannot be verified". Recipients open it once via:
 
-For frictionless distribution you need an [Apple Developer Program](https://developer.apple.com/programs/) membership and a *Developer ID Application* certificate, then add to `electron-builder.yml`:
+- **right-click → Open** → *Open* in the dialog, or
+- **System Settings → Privacy & Security → Open Anyway**, or
+- `xattr -cr /Applications/SHOWhisper.app` in the Terminal.
+
+After that first confirmation it launches normally.
+
+For fully frictionless opening (no prompt at all) you need an [Apple Developer Program](https://developer.apple.com/programs/) membership and a *Developer ID Application* certificate, then set in `electron-builder.yml`:
 
 ```yaml
 mac:
+  identity: "Developer ID Application: Your Name (TEAMID)"
   hardenedRuntime: true
   notarize: true   # needs APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID env vars
 ```

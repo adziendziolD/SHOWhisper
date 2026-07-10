@@ -3,6 +3,17 @@ productName: SHOWhisper
 
 mac:
   icon: assets/icon.icns
+  # Ad-hoc code signing ("-"): free, no Apple Developer account. Apple Silicon
+  # rejects an entirely unsigned app with the hard "app is damaged" error; an
+  # ad-hoc signature turns that into the milder "cannot be verified" prompt that
+  # users can bypass via right-click → Open (or System Settings → Open Anyway).
+  # Fully frictionless opening still requires a Developer ID + notarization.
+  identity: "-"
+  # Hardened runtime enables library validation, which (combined with ad-hoc
+  # signing) blocks our unsigned native prebuilds (onnxruntime-node, uiohook,
+  # nut-js) at launch. We don't notarize, so hardened runtime buys us nothing —
+  # keep it off so the native modules load.
+  hardenedRuntime: false
   # No fixed arch list: the architecture is driven by the build command
   # (electron-builder --arm64 / --x64) or defaults to the host arch. This
   # keeps each CI runner building only its own architecture, so the native
