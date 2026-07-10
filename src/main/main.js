@@ -436,7 +436,11 @@ function openSettings() {
   settingsWindow = new BrowserWindow({
     width: 440,
     height: 600,
+    // Size given as content (not outer frame) size, so the height the renderer
+    // reports maps 1:1 to setContentSize (see 'settings-resize').
+    useContentSize: true,
     resizable: false,
+    show: false,
     titleBarStyle: 'default',
     webPreferences: {
       preload: path.join(__dirname, '../preload/settings-preload.js'),
@@ -445,9 +449,27 @@ function openSettings() {
   })
 
   settingsWindow.loadFile(path.join(__dirname, '../renderer/settings.html'))
+  // Wait for the renderer's first height report before showing, so the window
+  // never flashes at the wrong size.
+  settingsWindow.once('ready-to-show', () => settingsWindow?.show())
   if (isDev) settingsWindow.webContents.openDevTools({ mode: 'detach' })
   settingsWindow.on('closed', () => { settingsWindow = null })
 }
+
+// The settings content height is dynamic: the cache list grows with the number
+// of cached models, and the download progress box appears/disappears. A fixed
+// window height either cut off the cache list or left dead space. The renderer
+// reports its rendered height (see settings.html) and we size the window to fit,
+// clamped to the screen so a very long list falls back to scrolling.
+ipcMain.on('settings-resize', (_e, height) => {
+  if (!settingsWindow || settingsWindow.isDestroyed()) return
+  const h = Math.round(height)
+  if (!Number.isFinite(h) || h <= 0) return
+  const { height: screenH } = screen.getPrimaryDisplay().workAreaSize
+  const clamped = Math.max(200, Math.min(h, screenH - 40))
+  const [w, currentH] = settingsWindow.getContentSize()
+  if (currentH !== clamped) settingsWindow.setContentSize(w, clamped)
+})
 
 ipcMain.handle('settings-get', () => ({
   provider: store.get('provider', 'Xenova'),
@@ -684,6 +706,19 @@ function buildTrayMenu() {
     { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
     { label: tr('menu.settings'), click: openSettings },
+    {
+      label: tr('menu.autostart'),
+      type: 'checkbox',
+      // getLoginItemSettings/setLoginItemSettings are backed by the OS launch
+      // service on macOS and the registry Run key on Windows - one API for both
+      // targets, no extra dependency. Electron toggles the checkmark itself and
+      // hands us the new state in item.checked.
+      checked: app.getLoginItemSettings().openAtLogin,
+      click: (item) => {
+        app.setLoginItemSettings({ openAtLogin: item.checked })
+        log('Autostart set:', item.checked)
+      },
+    },
     { type: 'separator' },
     { label: tr('menu.model'), enabled: false },
     ...modelItems,

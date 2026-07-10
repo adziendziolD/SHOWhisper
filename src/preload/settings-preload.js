@@ -24,4 +24,5 @@ contextBridge.exposeInMainWorld('settings', {
   cacheDelete:       (provider, model) => ipcRenderer.invoke('cache-delete', { provider, model }),
   cacheClear:        ()               => ipcRenderer.invoke('cache-clear-all'),
   cacheOpen:         ()               => ipcRenderer.send('cache-open'),
+  resize:            (height)         => ipcRenderer.send('settings-resize', height),
 })

@@ -9,6 +9,7 @@
 const translations = {
   german: {
     'menu.settings': 'Einstellungen…',
+    'menu.autostart': 'Beim Anmelden starten',
     'menu.model': 'Modell',
     'menu.quit': 'Beenden',
 
@@ -63,6 +64,7 @@ const translations = {
 
   english: {
     'menu.settings': 'Settings…',
+    'menu.autostart': 'Launch at login',
     'menu.model': 'Model',
     'menu.quit': 'Quit',
 
@@ -117,6 +119,7 @@ const translations = {
 
   french: {
     'menu.settings': 'Réglages…',
+    'menu.autostart': 'Lancer à la connexion',
     'menu.model': 'Modèle',
     'menu.quit': 'Quitter',
 

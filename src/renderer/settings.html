@@ -299,6 +299,13 @@
     let currentLang = 'german'
     const T = (key, vars) => window.i18n.t(currentLang, key, vars)
 
+    // Report the rendered content height to the main process so it can size the
+    // window to fit. The content height changes with the cache list length, the
+    // download progress box, and error messages, so observe the body instead of
+    // measuring only once.
+    const reportSize = () => window.settings.resize(document.body.scrollHeight)
+    new ResizeObserver(reportSize).observe(document.body)
+
     // Localize the whole settings window to the given language.
     function applyI18n(lang) {
       currentLang = lang
