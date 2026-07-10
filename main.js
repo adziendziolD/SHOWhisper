@@ -1,6 +1,5 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, safeStorage } = require('electron')
 const path = require('path')
-const os = require('os')
 const fs = require('fs')
 const { fork } = require('child_process')
 
@@ -139,7 +138,7 @@ async function loadModel(modelName, force = false) {
     const { pipeline, env } = await import('@huggingface/transformers')
 
     env.cacheDir = MODEL_CACHE_DIR
-    const hfToken = store.get('hfToken', '')
+    const hfToken = getHfToken()
     if (hfToken) {
       // ab transformers.js v4 kein env.authToken mehr, stattdessen eigener
       // fetch-Wrapper der den Authorization-Header setzt
@@ -309,57 +308,83 @@ async function loadModel(modelName, force = false) {
 async function transcribe(pcm) {
   if (!whisperPipeline) return ''
 
-  // Debug: PCM-Eckdaten loggen, um kaputtes/leeres Audio als Ursache
-  // auszuschließen (z.B. reine Stille, NaN, falsche Länge).
-  let min = Infinity, max = -Infinity, sumAbs = 0
-  for (let i = 0; i < pcm.length; i++) {
-    const v = pcm[i]
-    if (v < min) min = v
-    if (v > max) max = v
-    sumAbs += Math.abs(v)
-  }
-  log(`transcribe(): ${pcm.length} samples (${(pcm.length / 16000).toFixed(1)}s), ` +
-      `min=${min.toFixed(3)} max=${max.toFixed(3)} avgAbs=${(sumAbs / pcm.length).toFixed(4)}`)
-
-  const { WhisperTextStreamer } = await import('@huggingface/transformers')
-  // Live-Logging pro generiertem Token: zeigt in Echtzeit, ob/wo die
-  // Generierung hängt (nie gestartet vs. Wiederholungsschleife, die nicht
-  // von selbst terminiert).
-  // Zeitstempel pro Token: zeigt bei einem erneuten Hänger sofort, ob die
-  // Pro-Token-Zeit konstant bleibt (einfach langsam) oder wächst (Cache-
-  // Bug) - und ob überhaupt jemals ein Token generiert wurde.
-  const tStart = Date.now()
-  let lastTokenAt = tStart
-  let tokenCount = 0
-  const streamer = new WhisperTextStreamer(whisperPipeline.tokenizer, {
-    on_chunk_start: (x) => log(`  [streamer] Chunk-Start bei ${x.toFixed(2)}s`),
-    token_callback_function: (tokens) => {
-      const now = Date.now()
-      tokenCount++
-      log(`  [streamer] Token #${tokenCount} (+${now - lastTokenAt}ms, gesamt ${now - tStart}ms):`, tokens)
-      lastTokenAt = now
-    },
-    callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
-    on_chunk_end: (x) => log(`  [streamer] Chunk-Ende bei ${x.toFixed(2)}s`),
-    on_finalize: () => log(`  [streamer] Finalisiert`),
-  })
-
-  const t0 = Date.now()
-  // Whisper verarbeitet intern nur ein festes 30s-Fenster - ohne Chunking
-  // wird alles danach stillschweigend abgeschnitten. chunk_length_s aktiviert
-  // Long-Form-Transkription (überlappende 30s-Fenster werden zusammengefügt).
-  // max_new_tokens als Sicherheitsnetz gegen Wiederholungsschleifen, ein
-  // bekanntes Whisper-Fehlerbild bei Stille/Rauschen/unklarer Sprache.
-  const result = await whisperPipeline(pcm, {
+  const genOptions = {
     language: 'german',
     task: 'transcribe',
+    // Whisper verarbeitet intern nur ein festes 30s-Fenster - ohne Chunking
+    // wird alles danach stillschweigend abgeschnitten. chunk_length_s aktiviert
+    // Long-Form-Transkription (überlappende 30s-Fenster werden zusammengefügt).
     chunk_length_s: 30,
     stride_length_s: 5,
+    // max_new_tokens als Sicherheitsnetz gegen Wiederholungsschleifen, ein
+    // bekanntes Whisper-Fehlerbild bei Stille/Rauschen/unklarer Sprache.
     max_new_tokens: 440,
-    streamer,
-  })
+  }
+
+  // Verbose Diagnostik (PCM-Eckdaten + Live-Token-Streamer) nur im Dev-Modus:
+  // im Produktivbetrieb ist das reine Log-Flut und würde u.a. den erkannten
+  // Text tokenweise mitschreiben (Datenschutz bei einer Diktat-App).
+  if (isDev) {
+    let min = Infinity, max = -Infinity, sumAbs = 0
+    for (let i = 0; i < pcm.length; i++) {
+      const v = pcm[i]
+      if (v < min) min = v
+      if (v > max) max = v
+      sumAbs += Math.abs(v)
+    }
+    log(`transcribe(): ${pcm.length} samples (${(pcm.length / 16000).toFixed(1)}s), ` +
+        `min=${min.toFixed(3)} max=${max.toFixed(3)} avgAbs=${(sumAbs / pcm.length).toFixed(4)}`)
+
+    const { WhisperTextStreamer } = await import('@huggingface/transformers')
+    const tStart = Date.now()
+    let lastTokenAt = tStart
+    let tokenCount = 0
+    genOptions.streamer = new WhisperTextStreamer(whisperPipeline.tokenizer, {
+      on_chunk_start: (x) => log(`  [streamer] Chunk-Start bei ${x.toFixed(2)}s`),
+      token_callback_function: (tokens) => {
+        const now = Date.now()
+        tokenCount++
+        log(`  [streamer] Token #${tokenCount} (+${now - lastTokenAt}ms, gesamt ${now - tStart}ms):`, tokens)
+        lastTokenAt = now
+      },
+      callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
+      on_chunk_end: (x) => log(`  [streamer] Chunk-Ende bei ${x.toFixed(2)}s`),
+      on_finalize: () => log(`  [streamer] Finalisiert`),
+    })
+  }
+
+  const t0 = Date.now()
+  const result = await whisperPipeline(pcm, genOptions)
   log(`transcribe(): fertig nach ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   return result.text.trim()
+}
+
+// ── HF-Token (verschlüsselt über die OS-Keychain) ──────────────────────────────
+// Den HuggingFace-Token nicht im Klartext in der electron-store-JSON ablegen.
+// safeStorage nutzt die System-Keychain (macOS) bzw. DPAPI (Windows). Ist
+// Verschlüsselung nicht verfügbar (z.B. Linux ohne Keyring), Fallback auf
+// Klartext, damit die Funktion nicht komplett ausfällt.
+function setHfToken(token) {
+  store.delete('hfToken') // evtl. alten Klartext-Wert entfernen (Migration)
+  if (!token) { store.delete('hfTokenEnc'); return }
+  if (safeStorage.isEncryptionAvailable()) {
+    store.set('hfTokenEnc', safeStorage.encryptString(token).toString('base64'))
+  } else {
+    store.set('hfToken', token)
+  }
+}
+
+function getHfToken() {
+  const enc = store.get('hfTokenEnc', '')
+  if (enc) {
+    try {
+      return safeStorage.decryptString(Buffer.from(enc, 'base64'))
+    } catch (e) {
+      logErr('HF-Token konnte nicht entschlüsselt werden:', e.message)
+      return ''
+    }
+  }
+  return store.get('hfToken', '') // Fallback / Migration von altem Klartext
 }
 
 // ── Settings Window ──────────────────────────────────────────────────────────
@@ -388,19 +413,20 @@ function openSettings() {
 
 ipcMain.handle('settings-get', () => ({
   provider: store.get('provider', 'Xenova'),
-  hfToken:  store.get('hfToken', ''),
+  hfToken:  getHfToken(),
 }))
 
-ipcMain.handle('settings-save', async (_e, data) => {
-  // Sonderfall: URL öffnen (aus dem HF-Link im Form)
-  if (data.openUrl) {
-    shell.openExternal(data.openUrl)
-    return
-  }
+// Externen Link öffnen (HF-Token-Seite aus den Settings). Eigener Kanal statt
+// über settings-save gemischt; nur https zulassen, damit kein beliebiges
+// Schema (file://, etc.) aus dem Renderer geöffnet werden kann.
+ipcMain.on('shell-open', (_e, url) => {
+  if (typeof url === 'string' && /^https:\/\//i.test(url)) shell.openExternal(url)
+})
 
+ipcMain.handle('settings-save', async (_e, data) => {
   log('Settings gespeichert:', { provider: data.provider, hasToken: !!data.hfToken })
   store.set('provider', data.provider)
-  store.set('hfToken',  data.hfToken)
+  setHfToken(data.hfToken)
 
   // Modell mit neuen Settings neu laden. force=true umgeht die "lädt bereits"-
   // Sperre; ein evtl. noch laufender Ladevorgang wird über die loadGeneration
@@ -421,7 +447,8 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
   let text = ''
   try {
     text = await transcribe(Float32Array.from(pcm))
-    log(`Transkription: "${text}"`)
+    // Erkannten Text nur im Dev-Modus loggen (Datenschutz bei Diktat).
+    log(isDev ? `Transkription: "${text}"` : `Transkription fertig (${text.length} Zeichen)`)
   } catch (err) {
     logErr('Transkriptionsfehler:', err.message)
   }
@@ -475,7 +502,7 @@ ipcMain.on('recording-failed', (_e, message) => {
 
 function updateTrayLabel(label) {
   if (!tray) return
-  tray.setToolTip(label ? `SHOWisper – ${label}` : 'SHOWisper')
+  tray.setToolTip(label ? `SHOWhisper – ${label}` : 'SHOWhisper')
 }
 
 function buildTrayMenu() {
@@ -490,7 +517,7 @@ function buildTrayMenu() {
   }))
 
   const menu = Menu.buildFromTemplate([
-    { label: 'SHOWisper', enabled: false },
+    { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
     { label: 'Einstellungen…', click: openSettings },
     { type: 'separator' },
@@ -508,7 +535,7 @@ function createTray() {
   const idleIcon = nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray-idle.png'))
   idleIcon.setTemplateImage(true) // macOS: auto dark/light mode
   tray = new Tray(idleIcon)
-  tray.setToolTip('SHOWisper')
+  tray.setToolTip('SHOWhisper')
   buildTrayMenu()
 }
 
@@ -531,7 +558,7 @@ function setupHotkey() {
       dialog.showMessageBoxSync({
         type: 'warning',
         title: 'Accessibility-Zugriff benötigt',
-        message: 'SHOWisper benötigt Zugriff auf Bedienungshilfen für den globalen Hotkey.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
+        message: 'SHOWhisper benötigt Zugriff auf Bedienungshilfen für den globalen Hotkey.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
         buttons: ['Öffnen'],
       })
       // Löst macOS-Prompt aus
@@ -632,7 +659,7 @@ app.whenReady().then(async () => {
   const { default: Store } = await import('electron-store')
   store = new Store()
 
-  log(`SHOWisper startet (isDev=${isDev})`)
+  log(`SHOWhisper startet (isDev=${isDev})`)
   log(`userData: ${app.getPath('userData')}`)
   createTray()
   createOverlay()

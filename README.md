@@ -1,0 +1,117 @@
+<div align="center">
+  <img src="assets/icon.png" alt="SHOWhisper" width="128" height="128" />
+  <h1>SHOWhisper</h1>
+  <p><strong>Local, private voice dictation for macOS &amp; Windows.</strong></p>
+  <p>Press a hotkey, speak, and your words are transcribed on-device with Whisper and pasted into whatever app you're in. No cloud, no account, nothing leaves your machine.</p>
+</div>
+
+---
+
+## Features
+
+- 🎙️ **Global hotkey dictation** — press <kbd>⌥</kbd> <kbd>Space</kbd> to start, press again to stop. The transcript is pasted at your cursor.
+- 🔒 **Fully local & private** — transcription runs on-device via [Whisper](https://github.com/openai/whisper) (ONNX / [transformers.js](https://github.com/huggingface/transformers.js)). Audio never leaves your computer.
+- 🪟 **Floating pill overlay** — a small, always-on-top capsule shows a live waveform while recording, progress while transcribing, and a ✓ when done. Drag it anywhere; its position is remembered.
+- 🍎 **Menubar app** — lives in the tray/menubar, no dock clutter. Pick your model from the menu.
+- ⚡ **Apple Silicon acceleration** — uses CoreML on macOS where available, with an automatic CPU fallback.
+- 🧩 **Model choice** — from `tiny` (fast) to `large` (best quality), downloaded on demand and cached locally.
+
+## How it works
+
+```
+⌥Space ─► hotkey worker (isolated process)
+          └─► main process
+               ├─ overlay pill: recording → transcribing → done
+               ├─ Web Audio (renderer): capture + resample to 16 kHz mono PCM
+               ├─ Whisper (transformers.js): PCM → text
+               └─ clipboard + simulated ⌘V / Ctrl+V → paste into focused app
+```
+
+The global key listener runs in a **separate child process** (`hotkey-worker.js`) so that a crash in the native key-hook library can't take down the tray, overlay, or the loaded model — the worker is automatically respawned with backoff.
+
+## Requirements
+
+- macOS 12+ (Apple Silicon or Intel) or Windows 10/11
+- [Node.js](https://nodejs.org/) 18+ and npm (for building from source)
+
+### Permissions (macOS)
+
+On first launch macOS will ask for two permissions — both are required:
+
+| Permission | Why | Where to grant |
+|------------|-----|----------------|
+| **Accessibility** | global <kbd>⌥</kbd> <kbd>Space</kbd> hotkey + simulated paste | System Settings → Privacy & Security → Accessibility |
+| **Microphone** | recording your voice | System Settings → Privacy & Security → Microphone |
+
+## Getting started (from source)
+
+```bash
+git clone https://github.com/Adziendz/SHOWhisper.git
+cd SHOWhisper
+npm install
+npm start
+```
+
+The first time you use a model it is downloaded (once) and cached under the app's user-data directory.
+
+## Models
+
+Choose in the tray menu. Larger models are more accurate (especially for German) but need more RAM and are slower.
+
+| Model     | Size   | RAM     | Latency (M1) | Quality |
+|-----------|--------|---------|--------------|---------|
+| tiny      | 75 MB  | ~125 MB | ~0.5 s       | ⚠️      |
+| base      | 150 MB | ~250 MB | ~1 s         | ✅      |
+| small     | 450 MB | ~700 MB | ~2–3 s       | ✅✅    |
+| medium    | 1.5 GB | ~2.5 GB | ~6–8 s       | ✅✅✅  |
+| large     | 3 GB   | ~4.5 GB | ~15 s        | 🏆      |
+
+Default: `small`. Models are loaded from the [`Xenova`](https://huggingface.co/Xenova) HuggingFace namespace by default (public, no token). You can switch the provider or add a HuggingFace read-token in **Settings** (the token is stored encrypted via the OS keychain).
+
+> **Language:** the transcription language is currently fixed to German. See [Roadmap](#roadmap).
+
+## Building installers
+
+```bash
+npm run build
+```
+
+Output lands in `dist/` (`.dmg` on macOS, NSIS `.exe` on Windows). Native modules are unpacked from the asar archive automatically (see `electron-builder.yml`).
+
+> **After building, launch the packaged app once and run the full flow** (hotkey → model load → dictation → paste) — native modules only fully exercise in the packaged build, not just `npm start`.
+
+### Code signing & notarization (macOS)
+
+The build is **unsigned** by default. That's fine for local use, but on another Mac Gatekeeper will refuse to open it ("app is damaged / from an unidentified developer"). Recipients can right-click → Open, or run `xattr -cr SHOWhisper.app`.
+
+For frictionless distribution you need an [Apple Developer Program](https://developer.apple.com/programs/) membership and a *Developer ID Application* certificate, then add to `electron-builder.yml`:
+
+```yaml
+mac:
+  hardenedRuntime: true
+  notarize: true   # needs APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID env vars
+```
+
+## Development
+
+```bash
+npm run dev     # electron with NODE_ENV=development + devtools + verbose logs
+npm run lint    # eslint
+```
+
+Verbose per-token / PCM diagnostics and transcript logging are only emitted in development mode — production builds keep logs minimal and never log the recognized text.
+
+## Roadmap
+
+- Auto-update via `electron-updater`
+- Transcription history
+- Configurable language / auto-detect
+- Custom hotkey
+
+## Tech stack
+
+Electron · [@huggingface/transformers](https://github.com/huggingface/transformers.js) (Whisper via ONNX) · [@mukea/uiohook-napi](https://github.com/mukea/uiohook-napi) (global hotkey) · [@nut-tree-fork/nut-js](https://github.com/nut-tree/nut.js) (paste simulation) · electron-store · electron-builder
+
+## License
+
+[MIT](LICENSE) © Adziendz

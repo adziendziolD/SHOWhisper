@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
   <meta charset="UTF-8"/>
-  <title>SHOWisper – Einstellungen</title>
+  <title>SHOWhisper – Einstellungen</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -158,7 +158,7 @@
   </style>
 </head>
 <body>
-  <h1>🎙 SHOWisper – Einstellungen</h1>
+  <h1>🎙 SHOWhisper – Einstellungen</h1>
 
   <div class="field">
     <label>Modell-Provider</label>
@@ -203,9 +203,9 @@
     }
 
     function openHF() {
-      // shell.openExternal ist im renderer nicht verfügbar ohne nodeIntegration
-      // Einfachster Weg: über IPC im main öffnen
-      window.settings.save({ openUrl: 'https://huggingface.co/settings/tokens' })
+      // shell.openExternal ist im Renderer ohne nodeIntegration nicht verfügbar
+      // -> über den dedizierten shell-open-Kanal im Main-Prozess öffnen
+      window.settings.openExternal('https://huggingface.co/settings/tokens')
     }
 
     document.getElementById('btn-save').addEventListener('click', async () => {

@@ -1,4 +1,4 @@
-# SHOWisper – Plan
+# SHOWhisper – Plan
 
 Lokale, cross-platform Diktat-App (Mac + Windows) mit Whisper STT,
 Menubar-Integration und einem schwebenden Overlay-Effekt.
@@ -22,7 +22,7 @@ Menubar-Integration und einem schwebenden Overlay-Effekt.
 ## Dateistruktur
 
 ```
-SHOWisper/
+SHOWhisper/
 ├── PLAN.md
 ├── package.json
 ├── electron-builder.yml
@@ -160,28 +160,26 @@ npm run build
    ```bash
    npm run build
    ```
-   Ergebnis landet in `dist/` (z.B. `dist/SHOWisper-0.1.0-arm64.dmg` und `-x64.dmg`).
+   Ergebnis landet in `dist/` (z.B. `dist/SHOWhisper-0.1.0-arm64.dmg` und `-x64.dmg`).
    Dauert beim ersten Mal etwas länger (Electron-Binaries werden pro Architektur geladen).
 
-2. **Native Module prüfen:** SHOWisper hat mehrere native Abhängigkeiten
-   (`@mukea/uiohook-napi`, `onnxruntime-node`, `@nut-tree-fork/nut-js`).
-   Nach dem Build die gepackte App **einmal wirklich starten**
-   (`open dist/mac-arm64/SHOWisper.app` bzw. aus dem gemounteten DMG) und den
-   kompletten Flow durchklicken (Hotkey, Modell laden, Diktat, Einfügen) -
-   nicht nur `npm run build` als Erfolg werten. Falls native Module nicht
-   laden: in `electron-builder.yml` einen `asarUnpack`-Eintrag für die
-   betroffenen `node_modules/**/*.node`- bzw. `*.dylib`-Pfade ergänzen.
+2. **Native Module prüfen:** SHOWhisper hat mehrere native Abhängigkeiten
+   (`@mukea/uiohook-napi`, `onnxruntime-node`, `@nut-tree-fork/nut-js`). Diese
+   werden bereits über den `asarUnpack`-Eintrag in `electron-builder.yml` aus
+   dem asar-Archiv ausgepackt. Trotzdem nach dem Build die gepackte App
+   **einmal wirklich starten** (`open dist/mac-arm64/SHOWhisper.app` bzw. aus
+   dem gemounteten DMG) und den kompletten Flow durchklicken (Hotkey, Modell
+   laden, Diktat, Einfügen) - nicht nur `npm run build` als Erfolg werten.
 
 3. **Code-Signing / Gatekeeper (wichtig für „ausliefern" an andere):**
-   Aktuell ist im System nur ein *Apple Development*-Zertifikat vorhanden,
-   kein *Developer ID Application*-Zertifikat. Das heißt:
-   - **Unsigniert bauen** (Default aktuell) → funktioniert nur lokal bei dir
-     ohne Warnung. Bei jedem anderen Mac zeigt Gatekeeper „App ist
-     beschädigt" oder „kann nicht geöffnet werden, da der Entwickler nicht
-     verifiziert werden kann". Empfänger müssen dann manuell im Finder
-     Rechtsklick → Öffnen (oder `xattr -cr SHOWisper.app` im Terminal)
-     machen, um die Quarantäne-Warnung zu umgehen. Für einen kleinen,
-     technisch versierten Empfängerkreis (dich selbst, Testnutzer) ok.
+   - **Unsigniert bauen** (aktueller Default) → funktioniert lokal ohne
+     Warnung. Auf einem anderen Mac zeigt Gatekeeper „App ist beschädigt"
+     oder „kann nicht geöffnet werden, da der Entwickler nicht verifiziert
+     werden kann". Empfänger müssen dann manuell im Finder Rechtsklick →
+     Öffnen (oder `xattr -cr SHOWhisper.app` im Terminal) machen, um die
+     Quarantäne-Warnung zu umgehen. Für einen kleinen, technisch versierten
+     Empfängerkreis ok. Setzt ein *Developer ID Application*-Zertifikat
+     voraus, das nicht Teil des Repos ist.
    - **Für "normales" Ausliefern** (Empfänger sollen einfach doppelklicken
      können) braucht es eine **Apple Developer Program Mitgliedschaft**
      (99 $/Jahr) und ein **Developer ID Application**-Zertifikat daraus.
@@ -197,12 +195,12 @@ npm run build
      `APPLE_TEAM_ID` env-Variablen laufen lassen - electron-builder signiert
      und notarisiert dann automatisch während `npm run build`.
 
-4. **App-Icon:** Aktuell ist kein `icon:` in `electron-builder.yml` gesetzt,
-   die App bekommt das Standard-Electron-Icon. Für ein eigenes Icon eine
-   `.icns`-Datei (macOS) unter `assets/icon.icns` ablegen und in
-   `electron-builder.yml` unter `mac:` `icon: assets/icon.icns` ergänzen.
+4. **App-Icon:** Ist konfiguriert - `assets/icon.icns` (macOS) und
+   `assets/icon.ico` (Windows) sind in `electron-builder.yml` eingetragen.
+   Zum Ändern die Quelle `assets/icon.png` (1024×1024) ersetzen und die
+   `.icns`/`.ico` neu generieren.
 
-5. **Versionsnummer:** `package.json` steht noch auf `0.1.0` - vor dem
+5. **Versionsnummer:** `package.json` steht auf `0.1.0` - vor dem
    Ausliefern ggf. hochzählen, landet im DMG-Dateinamen.
 
 ---

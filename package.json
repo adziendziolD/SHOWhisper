@@ -1,12 +1,33 @@
 {
-  "name": "showisper",
+  "name": "showhisper",
   "version": "0.1.0",
-  "description": "Local Whisper dictation app with menubar and floating overlay",
+  "description": "Local, private Whisper dictation app for macOS & Windows — menubar app with a floating pill overlay and global hotkey.",
   "main": "main.js",
+  "author": "Adziendz",
+  "license": "MIT",
+  "homepage": "https://github.com/Adziendz/SHOWhisper#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Adziendz/SHOWhisper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Adziendz/SHOWhisper/issues"
+  },
+  "keywords": [
+    "whisper",
+    "speech-to-text",
+    "dictation",
+    "transcription",
+    "electron",
+    "offline",
+    "privacy",
+    "menubar"
+  ],
   "scripts": {
     "start": "electron .",
     "dev": "NODE_ENV=development electron . --inspect=5858",
-    "build": "electron-builder"
+    "build": "electron-builder",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
@@ -16,7 +37,8 @@
   },
   "devDependencies": {
     "electron": "^43.1.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "eslint": "^9.16.0"
   },
   "overrides": {
     "onnxruntime-node": "1.24.3"
