@@ -81,10 +81,17 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh resolves the repo from this env; the job has no checkout, so
+          # without it gh fails with "not a git repository".
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          FILES=$(find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \))
-          echo "Attaching:"; echo "$FILES"
+          # NUL-delimited into an array so installer names with spaces
+          # (e.g. "SHOWhisper Setup 0.3.2.exe") stay a single argument.
+          FILES=()
+          while IFS= read -r -d '' f; do FILES+=("$f"); done \
+            < <(find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -print0)
+          printf 'Attaching: %s\n' "${FILES[@]}"
           gh release create "$TAG" --title "$TAG" --generate-notes || true
-          gh release upload "$TAG" $FILES --clobber
+          gh release upload "$TAG" "${FILES[@]}" --clobber
