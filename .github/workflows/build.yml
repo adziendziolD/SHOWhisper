@@ -1,0 +1,88 @@
+name: Build
+
+# Builds the macOS DMG (arm64 + x64) and the Windows NSIS installer.
+# Runs on version tags (v*) and on manual dispatch. On a tag, the built
+# installers are attached to a GitHub Release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  # Fast, platform-independent gate. Keeps the expensive macOS/Windows
+  # build jobs from running when types or lint are broken.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each architecture builds on a runner of that architecture, so the
+          # native prebuilds npm installs match the target (no cross-arch dmg).
+          - os: macos-14        # Apple Silicon
+            build: npm run build -- --mac --arm64
+            artifact: macos-arm64
+          - os: macos-13        # Intel
+            build: npm run build -- --mac --x64
+            artifact: macos-x64
+          - os: windows-latest
+            build: npm run build -- --win
+            artifact: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Build installer
+        run: ${{ matrix.build }}
+        env:
+          # No signing certificate in CI: stop electron-builder from trying to
+          # sign with a keychain identity (would fail). Builds an unsigned app.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.dmg
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          FILES=$(find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \))
+          echo "Attaching:"; echo "$FILES"
+          gh release create "$TAG" --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" $FILES --clobber
