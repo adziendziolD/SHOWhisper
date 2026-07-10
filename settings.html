@@ -155,6 +155,82 @@
       text-align: right;
       margin-top: 5px;
     }
+
+    /* ── Modell-Cache ────────────────────────────────────────────────────── */
+    .cache-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    #cache-total {
+      font-size: 12px;
+      color: #888;
+      font-variant-numeric: tabular-nums;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .cache-sub {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 8px 0 10px;
+    }
+    .cache-sub a {
+      color: #5b5bd6;
+      text-decoration: none;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    #btn-clear-cache {
+      padding: 4px 10px;
+      font-size: 11px;
+      background: #2e2e34;
+      color: #f87171;
+    }
+    #btn-clear-cache:disabled { color: #555; cursor: default; }
+    .cache-list {
+      max-height: 150px;
+      overflow-y: auto;
+      border: 1px solid #2e2e34;
+      border-radius: 8px;
+      background: #1a1a1f;
+    }
+    .cache-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-bottom: 1px solid #2e2e34;
+    }
+    .cache-row:last-child { border-bottom: none; }
+    .cache-row .name {
+      flex: 1;
+      font-size: 12px;
+      color: #e8e8ea;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .cache-row .prov { color: #666; }
+    .cache-row .size {
+      font-size: 11px;
+      color: #888;
+      font-variant-numeric: tabular-nums;
+    }
+    .cache-row .del {
+      padding: 2px 8px;
+      font-size: 12px;
+      background: transparent;
+      color: #f87171;
+      border-radius: 6px;
+    }
+    .cache-row .del:disabled { color: #555; cursor: default; opacity: 0.5; }
+    .cache-empty {
+      padding: 14px;
+      text-align: center;
+      color: #555;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -195,12 +271,90 @@
 
   <div id="status"></div>
 
+  <div class="divider"></div>
+
+  <div id="cache-section">
+    <div class="cache-header">
+      <label style="margin:0">Modell-Cache</label>
+      <span id="cache-total">–</span>
+    </div>
+    <div class="cache-sub">
+      <a id="cache-open-link">Ordner öffnen →</a>
+      <button id="btn-clear-cache">Alles löschen</button>
+    </div>
+    <div id="cache-list" class="cache-list"></div>
+  </div>
+
   <script>
     async function init() {
       const cfg = await window.settings.get()
       document.getElementById('provider').value   = cfg.provider || 'Xenova'
       document.getElementById('hf-token').value   = cfg.hfToken  || ''
+      refreshCache()
     }
+
+    // ── Modell-Cache ──────────────────────────────────────────────────────────
+    function formatBytes(n) {
+      if (!n) return '0 MB'
+      const gb = n / 1e9
+      if (gb >= 1) return gb.toFixed(2).replace('.', ',') + ' GB'
+      return Math.round(n / 1e6) + ' MB'
+    }
+
+    function renderCache(snap) {
+      document.getElementById('cache-total').textContent = 'gesamt ' + formatBytes(snap.totalBytes)
+      const list = document.getElementById('cache-list')
+      const deletable = snap.models.filter((m) => !m.locked).length
+      document.getElementById('btn-clear-cache').disabled = deletable === 0
+      list.innerHTML = ''
+      if (!snap.models.length) {
+        list.innerHTML = '<div class="cache-empty">Keine Modelle gecacht</div>'
+        return
+      }
+      snap.models.sort((a, b) => b.sizeBytes - a.sizeBytes)
+      for (const m of snap.models) {
+        const row = document.createElement('div')
+        row.className = 'cache-row'
+
+        const name = document.createElement('span')
+        name.className = 'name'
+        name.textContent = m.model
+        const prov = document.createElement('span')
+        prov.className = 'prov'
+        prov.textContent = ' · ' + m.provider
+        name.appendChild(prov)
+
+        const size = document.createElement('span')
+        size.className = 'size'
+        size.textContent = formatBytes(m.sizeBytes)
+
+        const del = document.createElement('button')
+        del.className = 'del'
+        del.textContent = '🗑'
+        if (m.locked) {
+          del.disabled = true
+          del.title = 'aktives Modell – kann nicht gelöscht werden'
+        } else {
+          del.addEventListener('click', async () => {
+            if (!confirm(`„${m.model}" (${m.provider}) aus dem Cache löschen?`)) return
+            renderCache(await window.settings.cacheDelete(m.provider, m.model))
+          })
+        }
+
+        row.append(name, size, del)
+        list.appendChild(row)
+      }
+    }
+
+    async function refreshCache() {
+      renderCache(await window.settings.cacheList())
+    }
+
+    document.getElementById('cache-open-link').addEventListener('click', () => window.settings.cacheOpen())
+    document.getElementById('btn-clear-cache').addEventListener('click', async () => {
+      if (!confirm('Alle gecachten Modelle löschen (außer dem aktiven)?')) return
+      renderCache(await window.settings.cacheClear())
+    })
 
     function openHF() {
       // shell.openExternal ist im Renderer ohne nodeIntegration nicht verfügbar
@@ -236,6 +390,7 @@
         fill.style.width   = '100%'
         pct.textContent    = '100%'
         status.textContent = '✓ Modell geladen'
+        refreshCache() // frisch geladenes Modell in der Cache-Liste zeigen
         setTimeout(() => window.close(), 900)
       }
 

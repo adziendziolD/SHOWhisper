@@ -397,7 +397,7 @@ function openSettings() {
 
   settingsWindow = new BrowserWindow({
     width: 440,
-    height: 380,
+    height: 600,
     resizable: false,
     titleBarStyle: 'default',
     webPreferences: {
@@ -436,6 +436,113 @@ ipcMain.handle('settings-save', async (_e, data) => {
   whisperPipeline = null
   const currentModel = store.get('model', 'small')
   await loadModel(currentModel, true)
+})
+
+// ── Modell-Cache ───────────────────────────────────────────────────────────────
+// Gecachte Modelle liegen als `<provider>/whisper-<model>/`-Ordner unter
+// MODEL_CACHE_DIR (siehe env.cacheDir in loadModel). Größe pro Ordner ermitteln
+// und Löschen ermöglichen, damit große Modelle nicht unbemerkt die Platte füllen.
+
+function getDirSize(dir) {
+  let total = 0
+  let entries
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return 0 }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    try {
+      if (entry.isDirectory()) total += getDirSize(full)
+      else total += fs.statSync(full).size
+    } catch { /* Datei zwischenzeitlich weg - überspringen */ }
+  }
+  return total
+}
+
+// true, wenn dieses Modell gerade im RAM geladen ist oder gerade lädt - dann
+// nicht löschbar (würde einen Neu-Download beim nächsten Diktat erzwingen bzw.
+// einen laufenden Download beschädigen).
+function isModelLocked(provider, model) {
+  return provider === store.get('provider', 'Xenova') &&
+         model === store.get('model', 'small') &&
+         (whisperPipeline !== null || isLoadingModel)
+}
+
+function listCachedModels() {
+  const models = []
+  let providers
+  try { providers = fs.readdirSync(MODEL_CACHE_DIR, { withFileTypes: true }) } catch { return models }
+  for (const prov of providers) {
+    if (!prov.isDirectory()) continue
+    const provDir = path.join(MODEL_CACHE_DIR, prov.name)
+    let entries
+    try { entries = fs.readdirSync(provDir, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      const match = entry.isDirectory() && entry.name.match(/^whisper-(.+)$/)
+      if (!match) continue
+      const model = match[1]
+      models.push({
+        provider: prov.name,
+        model,
+        label: MODEL_LABELS[model] || model,
+        sizeBytes: getDirSize(path.join(provDir, entry.name)),
+        locked: isModelLocked(prov.name, model),
+      })
+    }
+  }
+  return models
+}
+
+function cacheSnapshot() {
+  const models = listCachedModels()
+  return {
+    dir: MODEL_CACHE_DIR,
+    totalBytes: models.reduce((sum, m) => sum + m.sizeBytes, 0),
+    models,
+  }
+}
+
+// Renderer-Eingaben nie ungeprüft in einen Pfad stecken: nur einfache Namen
+// zulassen und sicherstellen, dass der aufgelöste Pfad wirklich innerhalb von
+// MODEL_CACHE_DIR liegt (kein `..`-Traversal).
+function safeModelDir(provider, model) {
+  const NAME = /^[\w.-]+$/
+  if (!NAME.test(provider || '') || !NAME.test(model || '')) return null
+  const dir = path.resolve(MODEL_CACHE_DIR, provider, `whisper-${model}`)
+  const base = path.resolve(MODEL_CACHE_DIR)
+  if (dir !== path.join(base, provider, `whisper-${model}`)) return null
+  if (!dir.startsWith(base + path.sep)) return null
+  return dir
+}
+
+ipcMain.handle('cache-list', () => cacheSnapshot())
+
+ipcMain.handle('cache-delete', (_e, { provider, model } = {}) => {
+  if (isModelLocked(provider, model)) {
+    logErr('Cache-Löschen abgelehnt: aktives Modell', provider, model)
+    return cacheSnapshot()
+  }
+  const dir = safeModelDir(provider, model)
+  if (dir && fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true })
+    log('Cache gelöscht:', dir)
+  }
+  return cacheSnapshot()
+})
+
+ipcMain.handle('cache-clear-all', () => {
+  for (const m of listCachedModels()) {
+    if (m.locked) continue // aktives Modell behalten
+    const dir = safeModelDir(m.provider, m.model)
+    if (dir && fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true })
+      log('Cache gelöscht:', dir)
+    }
+  }
+  return cacheSnapshot()
+})
+
+ipcMain.on('cache-open', () => {
+  try { fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true }) } catch { /* existiert schon */ }
+  shell.openPath(MODEL_CACHE_DIR)
 })
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
