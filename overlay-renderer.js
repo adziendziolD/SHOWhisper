@@ -191,3 +191,12 @@ window.whisper.onModelLoading(handleModelLoading)
 // loading) would be lost - Electron doesn't buffer; a renderer that isn't
 // listening yet drops the message entirely.
 window.whisper.overlayReady()
+
+// ── i18n ──────────────────────────────────────────────────────────────────────
+function applyI18n(lang) {
+  document.querySelectorAll('[data-i18n]').forEach((el) => {
+    el.textContent = window.i18n.t(lang, el.dataset.i18n)
+  })
+}
+window.whisper.getLanguage().then(applyI18n)
+window.whisper.onLanguageChanged(applyI18n)

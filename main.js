@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPrefer
 const path = require('path')
 const fs = require('fs')
 const { fork } = require('child_process')
+const { t, translations } = require('./i18n')
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -26,6 +27,12 @@ function logErr(...args) {
 // electron-store is ESM-only since v9, main.js is CommonJS -> import it
 // dynamically once the app is ready (see app.whenReady())
 let store = null
+
+// Translate a UI string into the currently selected language (see i18n.js).
+// Only called after the store is ready (tray/dialogs run after whenReady).
+function tr(key, vars) {
+  return t(store.get('language', 'german'), key, vars)
+}
 
 let tray = null
 let overlayWindow = null
@@ -132,7 +139,7 @@ async function loadModel(modelName, force = false) {
   // overwriting freshly loaded state.
   const myGen = ++loadGeneration
   isLoadingModel = true
-  updateTrayLabel(`Lade ${modelName}…`)
+  updateTrayLabel(tr('tray.loading', { model: modelName }))
   overlayWindow?.showInactive()
 
   try {
@@ -275,7 +282,7 @@ async function loadModel(modelName, force = false) {
       return
     }
     logErr('Model load error:', err.message)
-    updateTrayLabel('Fehler beim Laden')
+    updateTrayLabel(tr('tray.loadError'))
 
     // Delete the corrupt cache so the next attempt downloads fresh
     const provider    = store.get('provider', 'Xenova')
@@ -293,8 +300,8 @@ async function loadModel(modelName, force = false) {
     // settings are NOT currently open (they show the error themselves).
     if (!settingsWindow || settingsWindow.isDestroyed()) {
       dialog.showErrorBox(
-        'Modell konnte nicht geladen werden',
-        `${provider}/whisper-${modelName} konnte nicht geladen werden:\n${err.message}`
+        tr('dialog.modelError.title'),
+        tr('dialog.modelError.body', { model: `${provider}/whisper-${modelName}`, error: err.message })
       )
     }
   } finally {
@@ -419,11 +426,21 @@ ipcMain.handle('settings-get', () => ({
 // Transcription language is a per-transcribe option, not baked into the loaded
 // model - so save it instantly on change, no model reload needed.
 ipcMain.on('set-language', (_e, lang) => {
-  if (LANGUAGES.includes(lang)) {
-    store.set('language', lang)
-    log('Sprache gesetzt:', lang)
-  }
+  if (!LANGUAGES.includes(lang)) return
+  store.set('language', lang)
+  log('Sprache gesetzt:', lang)
+  // Live-update the localized UI: rebuild the tray menu and tell the windows
+  // to re-apply their translations.
+  buildTrayMenu()
+  overlayWindow?.webContents.send('language-changed', lang)
+  settingsWindow?.webContents.send('language-changed', lang)
 })
+
+ipcMain.handle('get-language', () => store.get('language', 'german'))
+
+// Renderers are sandboxed and can't require('./i18n'), so hand them the whole
+// dictionary synchronously at preload time; they run the same small t() locally.
+ipcMain.on('i18n-sync', (e) => { e.returnValue = translations })
 
 // Open an external link (the HF token page from the settings). A dedicated
 // channel instead of mixing it into settings-save; only allow https so no
@@ -607,9 +624,8 @@ ipcMain.on('recording-failed', (_e, message) => {
   try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
   if (!settingsWindow || settingsWindow.isDestroyed()) {
     dialog.showErrorBox(
-      'Mikrofon nicht verfügbar',
-      `Die Aufnahme konnte nicht gestartet werden:\n${message || 'Unbekannter Fehler'}\n\n` +
-      'Bitte Mikrofon-Zugriff erlauben unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Mikrofon'
+      tr('dialog.mic.title'),
+      tr('dialog.mic.body', { error: message || tr('error.unknown') })
     )
   }
 })
@@ -635,12 +651,12 @@ function buildTrayMenu() {
   const menu = Menu.buildFromTemplate([
     { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
-    { label: 'Einstellungen…', click: openSettings },
+    { label: tr('menu.settings'), click: openSettings },
     { type: 'separator' },
-    { label: 'Modell', enabled: false },
+    { label: tr('menu.model'), enabled: false },
     ...modelItems,
     { type: 'separator' },
-    { label: 'Beenden', click: () => app.quit() },
+    { label: tr('menu.quit'), click: () => app.quit() },
   ])
 
   tray.setContextMenu(menu)
@@ -673,9 +689,9 @@ function setupHotkey() {
     if (!trusted) {
       dialog.showMessageBoxSync({
         type: 'warning',
-        title: 'Accessibility-Zugriff benötigt',
-        message: 'SHOWhisper benötigt Zugriff auf Bedienungshilfen für den globalen Hotkey.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
-        buttons: ['Öffnen'],
+        title: tr('dialog.a11y.title'),
+        message: tr('dialog.a11y.body'),
+        buttons: [tr('dialog.a11y.open')],
       })
       // Triggers the macOS prompt
       systemPreferences.isTrustedAccessibilityClient(true)
