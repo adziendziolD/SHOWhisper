@@ -7,19 +7,21 @@
 // worker, a crash still doesn't take the tray/overlay/the loaded Whisper
 // model in the main process down with it.
 
-function log(...args) {
+// This worker runs as a bare Node child and has no access to the log-file
+// path, so forward log lines to the main process (which writes them into the
+// shared electron-log file). Fall back to the console if the IPC channel is
+// already gone (e.g. during shutdown).
+function send(level, args) {
+  const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
   try {
-    const ts = new Date().toISOString().slice(11, 23)
-    console.log(`[${ts}] [hotkey]`, ...args)
-  } catch { /* ignore EPIPE */ }
+    process.send({ type: 'log', level, msg })
+  } catch {
+    try { (level === 'error' ? console.error : console.log)('[hotkey]', ...args) } catch { /* ignore */ }
+  }
 }
 
-function logErr(...args) {
-  try {
-    const ts = new Date().toISOString().slice(11, 23)
-    console.error(`[${ts}] [hotkey] ❌`, ...args)
-  } catch { /* ignore EPIPE */ }
-}
+function log(...args) { send('info', args) }
+function logErr(...args) { send('error', args) }
 
 const { UiohookKey, uIOhook } = require('@mukea/uiohook-napi')
 

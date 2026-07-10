@@ -3,6 +3,7 @@ const path = require('path')
 const fs = require('fs')
 const { fork } = require('child_process')
 const { t, translations } = require('./i18n')
+const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -10,19 +11,33 @@ const isDev = process.env.NODE_ENV === 'development'
 process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
 process.stderr.on('error', (e) => { if (e.code !== 'EPIPE') throw e })
 
-function log(...args) {
+// ── Logging (electron-log, size-based rotation) ────────────────────────────────
+// Persisted to the OS log dir (macOS: ~/Library/Logs/<AppName>/main.log,
+// Windows: %APPDATA%\<AppName>\logs\main.log) and echoed to the console.
+// Rotate at 1 MB and keep at most LOG_FILES files total (main.log + archives).
+const LOG_MAX_SIZE = 1024 * 1024 // 1 MB
+const LOG_FILES = 3              // e.g. main.log + main.1.log + main.2.log
+elog.transports.file.maxSize = LOG_MAX_SIZE
+elog.transports.file.archiveLogFn = (file) => {
+  const oldPath = file.toString()
+  const { dir, name, ext } = path.parse(oldPath)
   try {
-    const ts = new Date().toISOString().slice(11, 23)
-    console.log(`[${ts}]`, ...args)
-  } catch { /* ignore EPIPE */ }
+    const archives = LOG_FILES - 1
+    const oldest = path.join(dir, `${name}.${archives}${ext}`)
+    if (fs.existsSync(oldest)) fs.rmSync(oldest, { force: true })
+    for (let i = archives - 1; i >= 1; i--) {
+      const from = path.join(dir, `${name}.${i}${ext}`)
+      if (fs.existsSync(from)) fs.renameSync(from, path.join(dir, `${name}.${i + 1}${ext}`))
+    }
+    fs.renameSync(oldPath, path.join(dir, `${name}.1${ext}`))
+  } catch {
+    // Fallback: crop the current file rather than lose logging entirely.
+    try { file.crop(Math.min(Math.round(LOG_MAX_SIZE / 4), 256 * 1024)) } catch { /* ignore */ }
+  }
 }
 
-function logErr(...args) {
-  try {
-    const ts = new Date().toISOString().slice(11, 23)
-    console.error(`[${ts}] ❌`, ...args)
-  } catch { /* ignore EPIPE */ }
-}
+function log(...args) { elog.info(...args) }
+function logErr(...args) { elog.error(...args) }
 
 // electron-store is ESM-only since v9, main.js is CommonJS -> import it
 // dynamically once the app is ready (see app.whenReady())
@@ -739,6 +754,10 @@ function spawnHotkeyWorker() {
       hotkeyHolding = false
       setTrayRecording(false)
       overlayWindow.webContents.send('stop-recording')
+    } else if (msg?.type === 'log') {
+      // The worker forwards its logs here so they land in the same log file.
+      const fn = msg.level === 'error' ? logErr : log
+      fn('[hotkey]', msg.msg)
     } else if (msg?.type === 'error') {
       logErr('Hotkey worker error:', msg.message)
     }
@@ -793,6 +812,7 @@ app.whenReady().then(async () => {
 
   log(`SHOWhisper starting (isDev=${isDev})`)
   log(`userData: ${app.getPath('userData')}`)
+  log(`Log file: ${elog.transports.file.getFile()?.path}`)
   createTray()
   createOverlay()
   setupHotkey()
