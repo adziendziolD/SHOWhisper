@@ -39,6 +39,8 @@ let hotkeyRespawnCount = 0
 let hotkeyStableTimer = null
 let hotkeyDisabled = false     // circuit breaker tripped -> no further respawn
 let isQuitting = false
+// Supported transcription languages (Whisper language names)
+const LANGUAGES = ['german', 'english', 'french']
 // Xenova model names (public, no HF token needed)
 const MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 const MODEL_LABELS = { tiny: 'tiny (75 MB)', base: 'base (150 MB)', small: 'small (450 MB)', medium: 'medium (1.5 GB)', large: 'large (3 GB)' }
@@ -306,7 +308,7 @@ async function transcribe(pcm) {
   if (!whisperPipeline) return ''
 
   const genOptions = {
-    language: 'german',
+    language: store.get('language', 'german'),
     task: 'transcribe',
     // Whisper internally processes only a fixed 30s window - without chunking
     // everything after that is silently cut off. chunk_length_s enables
@@ -411,7 +413,17 @@ function openSettings() {
 ipcMain.handle('settings-get', () => ({
   provider: store.get('provider', 'Xenova'),
   hfToken:  getHfToken(),
+  language: store.get('language', 'german'),
 }))
+
+// Transcription language is a per-transcribe option, not baked into the loaded
+// model - so save it instantly on change, no model reload needed.
+ipcMain.on('set-language', (_e, lang) => {
+  if (LANGUAGES.includes(lang)) {
+    store.set('language', lang)
+    log('Sprache gesetzt:', lang)
+  }
+})
 
 // Open an external link (the HF token page from the settings). A dedicated
 // channel instead of mixing it into settings-save; only allow https so no

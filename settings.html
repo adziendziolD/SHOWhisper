@@ -237,6 +237,16 @@
   <h1>🎙 SHOWhisper – Einstellungen</h1>
 
   <div class="field">
+    <label>Transkriptions-Sprache</label>
+    <select id="language">
+      <option value="german">Deutsch</option>
+      <option value="english">Englisch</option>
+      <option value="french">Französisch</option>
+    </select>
+    <p class="hint">Sprache, in der du sprichst und die transkribiert wird. <span id="lang-status"></span></p>
+  </div>
+
+  <div class="field">
     <label>Modell-Provider</label>
     <select id="provider">
       <option value="Xenova">Xenova (public, kein Token nötig)</option>
@@ -288,6 +298,7 @@
   <script>
     async function init() {
       const cfg = await window.settings.get()
+      document.getElementById('language').value   = cfg.language || 'german'
       document.getElementById('provider').value   = cfg.provider || 'Xenova'
       document.getElementById('hf-token').value   = cfg.hfToken  || ''
       refreshCache()
@@ -404,6 +415,15 @@
     })
 
     document.getElementById('btn-cancel').addEventListener('click', () => window.close())
+
+    // Language is saved instantly on change (no model reload needed).
+    document.getElementById('language').addEventListener('change', (e) => {
+      window.settings.setLanguage(e.target.value)
+      const s = document.getElementById('lang-status')
+      s.textContent = '✓ gespeichert'
+      s.style.color = '#4ade80'
+      setTimeout(() => { s.textContent = '' }, 1500)
+    })
 
     init()
   </script>
