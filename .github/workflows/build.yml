@@ -30,17 +30,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Each architecture builds on a runner of that architecture, so the
-          # native prebuilds npm installs match the target (no cross-arch dmg).
+          # macOS is arm64-only: the global-hotkey dependency
+          # @mukea/uiohook-napi ships no darwin-x64 prebuild, so an Intel
+          # dmg can't load it. (GitHub's macos-13 Intel runners are also
+          # being retired.) Windows is x64.
           # --publish never: electron-builder auto-publishes to GitHub
           # Releases when it sees a git tag; we publish from the release job
           # below instead, so disable its implicit publishing here.
           - os: macos-14        # Apple Silicon
             build: npm run build -- --mac --arm64 --publish never
             artifact: macos-arm64
-          - os: macos-13        # Intel
-            build: npm run build -- --mac --x64 --publish never
-            artifact: macos-x64
           - os: windows-latest
             build: npm run build -- --win --publish never
             artifact: windows-x64
