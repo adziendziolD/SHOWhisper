@@ -15,15 +15,17 @@ const translations = {
 
     'tray.loading': 'Lade {model}…',
     'tray.loadError': 'Fehler beim Laden',
-    'tray.hotkeyDisabled': 'Hotkey deaktiviert – App neu starten',
+    'tray.hotkeyUnavailable': 'Hotkey ⌥Leertaste belegt',
 
     'dialog.modelError.title': 'Modell konnte nicht geladen werden',
     'dialog.modelError.body': '{model} konnte nicht geladen werden:\n{error}',
     'dialog.mic.title': 'Mikrofon nicht verfügbar',
     'dialog.mic.body': 'Die Aufnahme konnte nicht gestartet werden:\n{error}\n\nBitte Mikrofon-Zugriff erlauben unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Mikrofon',
     'dialog.a11y.title': 'Accessibility-Zugriff benötigt',
-    'dialog.a11y.body': 'SHOWhisper benötigt Zugriff auf Bedienungshilfen für den globalen Hotkey.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
+    'dialog.a11y.body': 'SHOWhisper benötigt Zugriff auf Bedienungshilfen, um den transkribierten Text automatisch einzufügen. Ohne diesen Zugriff bleibt der Text zum manuellen Einfügen in der Zwischenablage.\n\nBitte erlaube den Zugriff unter:\nSystemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen',
     'dialog.a11y.open': 'Öffnen',
+    'dialog.hotkey.title': 'Hotkey nicht verfügbar',
+    'dialog.hotkey.body': 'Der Hotkey ⌥Leertaste ist bereits von einer anderen App belegt. Das Diktat lässt sich daher nicht per Tastenkürzel starten.',
 
     'overlay.loading': 'Modell wird geladen…',
     'overlay.transcribing': 'Wird transkribiert…',
@@ -70,15 +72,17 @@ const translations = {
 
     'tray.loading': 'Loading {model}…',
     'tray.loadError': 'Load failed',
-    'tray.hotkeyDisabled': 'Hotkey disabled – restart the app',
+    'tray.hotkeyUnavailable': 'Hotkey ⌥Space unavailable',
 
     'dialog.modelError.title': 'Model could not be loaded',
     'dialog.modelError.body': '{model} could not be loaded:\n{error}',
     'dialog.mic.title': 'Microphone unavailable',
     'dialog.mic.body': 'Recording could not be started:\n{error}\n\nPlease allow microphone access under:\nSystem Settings → Privacy & Security → Microphone',
     'dialog.a11y.title': 'Accessibility access required',
-    'dialog.a11y.body': 'SHOWhisper needs Accessibility access for the global hotkey.\n\nPlease allow access under:\nSystem Settings → Privacy & Security → Accessibility',
+    'dialog.a11y.body': 'SHOWhisper needs Accessibility access to paste the transcribed text automatically. Without it, the text stays on the clipboard for a manual paste.\n\nPlease allow access under:\nSystem Settings → Privacy & Security → Accessibility',
     'dialog.a11y.open': 'Open',
+    'dialog.hotkey.title': 'Hotkey unavailable',
+    'dialog.hotkey.body': 'The hotkey ⌥Space is already in use by another app, so dictation cannot be triggered by the keyboard shortcut.',
 
     'overlay.loading': 'Loading model…',
     'overlay.transcribing': 'Transcribing…',
@@ -125,15 +129,17 @@ const translations = {
 
     'tray.loading': 'Chargement de {model}…',
     'tray.loadError': 'Échec du chargement',
-    'tray.hotkeyDisabled': "Raccourci désactivé – redémarrez l'application",
+    'tray.hotkeyUnavailable': 'Raccourci ⌥Espace indisponible',
 
     'dialog.modelError.title': 'Impossible de charger le modèle',
     'dialog.modelError.body': 'Impossible de charger {model} :\n{error}',
     'dialog.mic.title': 'Microphone indisponible',
     'dialog.mic.body': "Impossible de démarrer l'enregistrement :\n{error}\n\nVeuillez autoriser l'accès au microphone dans :\nRéglages Système → Confidentialité et sécurité → Microphone",
     'dialog.a11y.title': "Accès à l'accessibilité requis",
-    'dialog.a11y.body': "SHOWhisper a besoin de l'accès à l'accessibilité pour le raccourci global.\n\nVeuillez autoriser l'accès dans :\nRéglages Système → Confidentialité et sécurité → Accessibilité",
+    'dialog.a11y.body': "SHOWhisper a besoin de l'accès à l'accessibilité pour coller automatiquement le texte transcrit. Sans cet accès, le texte reste dans le presse-papiers pour un collage manuel.\n\nVeuillez autoriser l'accès dans :\nRéglages Système → Confidentialité et sécurité → Accessibilité",
     'dialog.a11y.open': 'Ouvrir',
+    'dialog.hotkey.title': 'Raccourci indisponible',
+    'dialog.hotkey.body': "Le raccourci ⌥Espace est déjà utilisé par une autre application. La dictée ne peut donc pas être déclenchée par le raccourci clavier.",
 
     'overlay.loading': 'Chargement du modèle…',
     'overlay.transcribing': 'Transcription…',

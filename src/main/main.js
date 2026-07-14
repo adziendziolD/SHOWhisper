@@ -1,7 +1,6 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, safeStorage } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, safeStorage, globalShortcut } = require('electron')
 const path = require('path')
 const fs = require('fs')
-const { fork } = require('child_process')
 const { t, translations } = require('../shared/i18n')
 const elog = require('electron-log/main')
 
@@ -68,14 +67,8 @@ let settingsWindow = null
 let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
 let isLoadingModel = false
 let loadGeneration = 0         // prevents a superseded load from overwriting state
-/** @type {import('child_process').ChildProcess | null} */
-let hotkeyWorker = null        // current child process (see hotkey-worker.js)
-let hotkeyHolding = false      // crash recovery: is a recording in progress?
-let hotkeyRespawnCount = 0
-/** @type {ReturnType<typeof setTimeout> | null} */
-let hotkeyStableTimer = null
-let hotkeyDisabled = false     // circuit breaker tripped -> no further respawn
-let isQuitting = false
+let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
+let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
 // Supported transcription languages (Whisper language names)
 const LANGUAGES = ['german', 'english', 'french']
 // Xenova model names (public, no HF token needed)
@@ -672,10 +665,9 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
 // stuck (the next ⌥Space would only resync).
 ipcMain.on('recording-failed', (_e, message) => {
   logErr('Recording failed (renderer):', message)
-  hotkeyHolding = false
+  isRecording = false
   setTrayRecording(false)
   overlayWindow?.hide()
-  try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
   if (!settingsWindow || settingsWindow.isDestroyed()) {
     dialog.showErrorBox(
       tr('dialog.mic.title'),
@@ -746,111 +738,77 @@ function setTrayRecording(recording) {
   tray.setImage(icon)
 }
 
-// ── Hotkey (Push-to-Talk) ─────────────────────────────────────────────────────
+// ── Hotkey (Toggle) ────────────────────────────────────────────────────────────
 
-function setupHotkey() {
-  // Check the accessibility permission (macOS). Without it there's no global keyup/keydown.
-  if (process.platform === 'darwin') {
-    const trusted = systemPreferences.isTrustedAccessibilityClient(false)
-    log('Accessibility check (main process):', trusted)
-    if (!trusted) {
-      dialog.showMessageBoxSync({
-        type: 'warning',
-        title: tr('dialog.a11y.title'),
-        message: tr('dialog.a11y.body'),
-        buttons: [tr('dialog.a11y.open')],
-      })
-      // Triggers the macOS prompt
-      systemPreferences.isTrustedAccessibilityClient(true)
-      app.quit()
+const HOTKEY_ACCELERATOR = 'Alt+Space' // Alt == ⌥ Option on macOS
+
+// ⌥Space toggles recording. Registered via Electron's globalShortcut, which uses
+// the OS hot-key API (Carbon RegisterEventHotKey on macOS, RegisterHotKey on
+// Windows). Unlike a global keyboard hook (uiohook/CGEventTap), this never sits
+// in the system-wide input delivery path, so it can't freeze keyboard/mouse
+// input for the whole machine.
+function toggleRecording() {
+  // globalShortcut can fire repeatedly while the combo is held (OS key auto-
+  // repeat). Debounce so a brief hold doesn't rapidly flip start/stop.
+  const now = Date.now()
+  if (now - lastToggleAt < 300) return
+  lastToggleAt = now
+
+  if (!isRecording) {
+    // While the model is still loading, whisperPipeline is either null or being
+    // reassigned - don't start recording, otherwise the audio is lost or
+    // transcribe() finds no model. Just don't flip the toggle.
+    if (isLoadingModel) {
+      log('Recording ignored: model still loading')
       return
     }
-  }
-
-  spawnHotkeyWorker()
-}
-
-// uiohook-napi has a known, unfixed fatal-error bug (SnosMe/uiohook-napi#50)
-// that terminates the whole process without warning. So it runs isolated in
-// its own child process (hotkey-worker.js) - if that dies, the tray/overlay/
-// the loaded Whisper model don't die with it.
-const HOTKEY_BACKOFF_MS = [500, 1000, 2000, 4000, 8000]
-const HOTKEY_MAX_RESPAWNS = HOTKEY_BACKOFF_MS.length
-
-function spawnHotkeyWorker() {
-  if (isQuitting || hotkeyDisabled) return
-
-  hotkeyWorker = fork(path.join(__dirname, 'hotkey-worker.js'), [], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-  })
-
-  hotkeyWorker.on('message', (raw) => {
-    const msg = /** @type {HotkeyWorkerMessage} */ (raw)
-    if (msg?.type === 'started') {
-      log('Hotkey worker ready, PID', hotkeyWorker?.pid)
-    } else if (msg?.type === 'start-recording') {
-      // While the model is still loading, whisperPipeline is either null or
-      // being reassigned - don't start recording, otherwise the audio is lost
-      // or transcribe() finds no model.
-      if (isLoadingModel) {
-        log('Recording ignored: model still loading')
-        // The worker already switched to "recording" internally - reset it,
-        // otherwise the next keypress is only spent resyncing (no effect).
-        try { hotkeyWorker?.send({ type: 'reset' }) } catch { /* channel may already be closed */ }
-        return
-      }
-      hotkeyHolding = true
-      setTrayRecording(true)
-      overlayWindow?.showInactive()
-      overlayWindow?.webContents.send('start-recording')
-    } else if (msg?.type === 'stop-recording') {
-      hotkeyHolding = false
-      setTrayRecording(false)
-      overlayWindow?.webContents.send('stop-recording')
-    } else if (msg?.type === 'log') {
-      // The worker forwards its logs here so they land in the same log file.
-      const fn = msg.level === 'error' ? logErr : log
-      fn('[hotkey]', msg.msg)
-    } else if (msg?.type === 'error') {
-      logErr('Hotkey worker error:', msg.message)
-    }
-  })
-
-  hotkeyWorker.on('exit', (code, signal) => handleHotkeyWorkerExit(code, signal))
-  hotkeyWorker.on('error', (err) => logErr('Hotkey worker could not be started:', errMsg(err)))
-
-  // After a stable runtime, reset the respawn counter so that a single crash
-  // after a long error-free runtime doesn't immediately trip the circuit breaker.
-  if (hotkeyStableTimer) clearTimeout(hotkeyStableTimer)
-  hotkeyStableTimer = setTimeout(() => { hotkeyRespawnCount = 0 }, 30000)
-}
-
-function handleHotkeyWorkerExit(code, signal) {
-  if (hotkeyStableTimer) clearTimeout(hotkeyStableTimer)
-  hotkeyWorker = null
-
-  // Crashed in the middle of a held recording -> don't leave overlay/tray hanging
-  if (hotkeyHolding) {
-    hotkeyHolding = false
+    isRecording = true
+    setTrayRecording(true)
+    overlayWindow?.showInactive()
+    overlayWindow?.webContents.send('start-recording')
+  } else {
+    isRecording = false
     setTrayRecording(false)
     overlayWindow?.webContents.send('stop-recording')
-    overlayWindow?.hide()
   }
+}
 
-  if (isQuitting) return // intentional shutdown, no respawn
-
-  logErr(`Hotkey worker exited (code=${code}, signal=${signal})`)
-
-  if (hotkeyRespawnCount >= HOTKEY_MAX_RESPAWNS) {
-    hotkeyDisabled = true
-    logErr('Hotkey worker crashed repeatedly, giving up on restarts')
-    updateTrayLabel('Hotkey deaktiviert – App neu starten')
+function setupHotkey() {
+  const ok = globalShortcut.register(HOTKEY_ACCELERATOR, toggleRecording)
+  if (!ok || !globalShortcut.isRegistered(HOTKEY_ACCELERATOR)) {
+    // Registration fails when another app already owns the combo. The hotkey is
+    // the only way to trigger recording, so surface it rather than fail silently
+    // - but don't block startup (the tray/settings still work).
+    logErr(`Global shortcut ${HOTKEY_ACCELERATOR} could not be registered (already in use)`)
+    updateTrayLabel(tr('tray.hotkeyUnavailable'))
+    dialog.showMessageBox({
+      type: 'warning',
+      title: tr('dialog.hotkey.title'),
+      message: tr('dialog.hotkey.body'),
+    })
     return
   }
+  log(`Global shortcut registered: ${HOTKEY_ACCELERATOR}`)
+}
 
-  const delay = HOTKEY_BACKOFF_MS[hotkeyRespawnCount]
-  hotkeyRespawnCount++
-  setTimeout(spawnHotkeyWorker, delay)
+// nut-js simulates ⌘V/Ctrl+V to paste the transcript (see 'audio-ready'). On
+// macOS that needs Accessibility permission. globalShortcut itself does NOT, so
+// this is non-fatal: without it, recording/transcription still work and the text
+// stays on the clipboard for a manual paste - just the auto-paste is skipped.
+function checkAccessibilityForPaste() {
+  if (process.platform !== 'darwin') return
+  const trusted = systemPreferences.isTrustedAccessibilityClient(false)
+  log('Accessibility check (main process):', trusted)
+  if (!trusted) {
+    // Triggers the macOS prompt, then inform (non-blocking) and continue.
+    systemPreferences.isTrustedAccessibilityClient(true)
+    dialog.showMessageBox({
+      type: 'info',
+      title: tr('dialog.a11y.title'),
+      message: tr('dialog.a11y.body'),
+      buttons: [tr('dialog.a11y.open')],
+    })
+  }
 }
 
 // ── App Lifecycle ─────────────────────────────────────────────────────────────
@@ -868,6 +826,7 @@ app.whenReady().then(async () => {
   log(`Log file: ${elog.transports.file.getFile()?.path}`)
   createTray()
   createOverlay()
+  checkAccessibilityForPaste()
   setupHotkey()
 
   let savedModel = /** @type {string} */ (store.get('model', 'small'))
@@ -879,13 +838,4 @@ app.whenReady().then(async () => {
 // event, so keep calling preventDefault to keep the tray app alive.
 app.on('window-all-closed', /** @type {() => void} */ ((e) => /** @type {any} */ (e).preventDefault())) // tray app stays open
 
-app.on('before-quit', () => { isQuitting = true })
-
-app.on('will-quit', () => {
-  if (hotkeyWorker) {
-    try { hotkeyWorker.send({ type: 'shutdown' }) } catch { /* channel may already be closed */ }
-    // Fallback in case the worker doesn't exit cleanly in time
-    const w = hotkeyWorker
-    setTimeout(() => { try { w.kill() } catch { /* already terminated */ } }, 500)
-  }
-})
+app.on('will-quit', () => { globalShortcut.unregisterAll() })

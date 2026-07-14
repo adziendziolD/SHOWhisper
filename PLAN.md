@@ -10,7 +10,7 @@ Menubar-Integration und einem schwebenden Overlay-Effekt.
 | Aufgabe              | Library                         | Begründung                                      |
 |----------------------|---------------------------------|-------------------------------------------------|
 | App-Shell + Tray     | `electron`                      | Built-in Tray, globalShortcut, BrowserWindow    |
-| Hotkey (Toggle)      | `@mukea/uiohook-napi`           | Globales keydown, isoliert in eigenem Kindprozess |
+| Hotkey (Toggle)      | Electron `globalShortcut`       | OS-Hotkey-API, kein blockierender Event-Tap       |
 | Audio aufnehmen      | Web Audio API (Renderer)        | Browser-nativ, kein extra Package               |
 | STT                  | `@huggingface/transformers`     | Whisper via ONNX, reines JS, kein nativer Build |
 | Text einfügen        | `@nut-tree/nut-js`              | Cross-platform Tastatur-Simulation (⌘V/Ctrl+V)  |
@@ -44,8 +44,7 @@ SHOWhisper/
 main.js (Main Process)
 ├── Tray
 │   └── Menü: Modell wählen (tiny/base/small/medium/large) + Beenden
-├── hotkey-worker.js (isolierter Kindprozess, @mukea/uiohook-napi)
-│   └── keydown ⌥Space (Toggle) → IPC → Renderer: "start-recording" / "stop-recording"
+├── globalShortcut ⌥Space (Toggle) → Renderer: "start-recording" / "stop-recording"
 ├── IPC Handler: "audio-ready"
 │   ├── @huggingface/transformers (Whisper, Modell im RAM gehalten)
 │   └── transkribierter Text → @nut-tree/nut-js → ⌘V / Ctrl+V
@@ -164,7 +163,7 @@ npm run build
    Dauert beim ersten Mal etwas länger (Electron-Binaries werden pro Architektur geladen).
 
 2. **Native Module prüfen:** SHOWhisper hat mehrere native Abhängigkeiten
-   (`@mukea/uiohook-napi`, `onnxruntime-node`, `@nut-tree-fork/nut-js`). Diese
+   (`onnxruntime-node`, `@nut-tree-fork/nut-js`). Diese
    werden bereits über den `asarUnpack`-Eintrag in `electron-builder.yml` aus
    dem asar-Archiv ausgepackt. Trotzdem nach dem Build die gepackte App
    **einmal wirklich starten** (`open dist/mac-arm64/SHOWhisper.app` bzw. aus

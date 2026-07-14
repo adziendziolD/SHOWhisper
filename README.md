@@ -19,15 +19,14 @@
 ## How it works
 
 ```
-⌥Space ─► hotkey worker (isolated process)
-          └─► main process
+⌥Space ─► global shortcut (main process)
                ├─ overlay pill: recording → transcribing → done
                ├─ Web Audio (renderer): capture + resample to 16 kHz mono PCM
                ├─ Whisper (transformers.js): PCM → text
                └─ clipboard + simulated ⌘V / Ctrl+V → paste into focused app
 ```
 
-The global key listener runs in a **separate child process** (`hotkey-worker.js`) so that a crash in the native key-hook library can't take down the tray, overlay, or the loaded model — the worker is automatically respawned with backoff.
+The <kbd>⌥</kbd> <kbd>Space</kbd> toggle is registered through Electron's built-in `globalShortcut` (the OS hot-key API), so it never sits in the system-wide input path and can't stall keyboard or mouse input.
 
 ## Requirements
 
@@ -36,12 +35,12 @@ The global key listener runs in a **separate child process** (`hotkey-worker.js`
 
 ### Permissions (macOS)
 
-On first launch macOS will ask for two permissions — both are required:
+On first launch macOS will ask for these permissions:
 
 | Permission | Why | Where to grant |
 |------------|-----|----------------|
-| **Accessibility** | global <kbd>⌥</kbd> <kbd>Space</kbd> hotkey + simulated paste | System Settings → Privacy & Security → Accessibility |
-| **Microphone** | recording your voice | System Settings → Privacy & Security → Microphone |
+| **Microphone** | recording your voice (required) | System Settings → Privacy & Security → Microphone |
+| **Accessibility** | simulated paste of the transcript (optional: without it the text stays on the clipboard for a manual paste) | System Settings → Privacy & Security → Accessibility |
 
 ## Getting started (from source)
 
@@ -117,7 +116,7 @@ Verbose per-token / PCM diagnostics and transcript logging are only emitted in d
 
 ## Tech stack
 
-Electron · [@huggingface/transformers](https://github.com/huggingface/transformers.js) (Whisper via ONNX) · [@mukea/uiohook-napi](https://github.com/mukea/uiohook-napi) (global hotkey) · [@nut-tree-fork/nut-js](https://github.com/nut-tree/nut.js) (paste simulation) · electron-store · electron-builder
+Electron (built-in `globalShortcut` for the hotkey) · [@huggingface/transformers](https://github.com/huggingface/transformers.js) (Whisper via ONNX) · [@nut-tree-fork/nut-js](https://github.com/nut-tree/nut.js) (paste simulation) · electron-store · electron-builder
 
 ## License
 

@@ -10,14 +10,14 @@ mac:
   # Fully frictionless opening still requires a Developer ID + notarization.
   identity: "-"
   # Hardened runtime enables library validation, which (combined with ad-hoc
-  # signing) blocks our unsigned native prebuilds (onnxruntime-node, uiohook,
-  # nut-js) at launch. We don't notarize, so hardened runtime buys us nothing —
-  # keep it off so the native modules load.
+  # signing) blocks our unsigned native prebuilds (onnxruntime-node, nut-js) at
+  # launch. We don't notarize, so hardened runtime buys us nothing — keep it off
+  # so the native modules load.
   hardenedRuntime: false
   # No fixed arch list: the architecture is driven by the build command
   # (electron-builder --arm64 / --x64) or defaults to the host arch. This
   # keeps each CI runner building only its own architecture, so the native
-  # prebuilds (onnxruntime-node, uiohook-napi are fetched per host arch)
+  # prebuilds (onnxruntime-node, nut-js are fetched per host arch)
   # match the target instead of shipping arm64 binaries inside an x64 dmg.
   target:
     - dmg
@@ -37,7 +37,6 @@ asar: true
 # can't find the *.node/*.dylib binaries in the packaged build (the app starts
 # locally via `npm start`, but the .dmg version fails to load the modules).
 asarUnpack:
-  - "**/node_modules/@mukea/uiohook-napi/**"
   - "**/node_modules/@nut-tree-fork/**"
   - "**/node_modules/onnxruntime-node/**"
   - "**/*.node"
