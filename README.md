@@ -15,6 +15,21 @@
 - 🍎 **Menubar app** — lives in the tray/menubar, no dock clutter. Pick your model from the menu.
 - ⚡ **Apple Silicon acceleration** — uses CoreML on macOS where available, with an automatic CPU fallback.
 - 🧩 **Model choice** — from `tiny` (fast) to `large` (best quality), downloaded on demand and cached locally.
+- 💬 **Spoken quote markers** — say a marker phrase around direct speech and it becomes proper typographic quotes in your language (see below).
+
+## Dictating quotes
+
+Whisper can't tell direct speech from description on its own, so you mark it by voice. Speak an *open* phrase, the quoted words, then a *close* phrase, and the app rewrites them into the correct quotation marks for the selected transcription language.
+
+Example (German): saying *“Er sagte Zitat Anfang das ist unmöglich Zitat Ende”* produces **Er sagte „das ist unmöglich“**.
+
+| Language | Open (say one of) | Close (say one of) | Result |
+|----------|-------------------|--------------------|--------|
+| German   | „Zitat Anfang“, „Anführungszeichen auf“ | „Zitat Ende“, „Anführungszeichen zu“ | `„…“` |
+| English  | “open quote”, “begin quote”, “quote” | “close quote”, “end quote”, “unquote” | `“…”` |
+| French   | « ouvrez les guillemets », « ouvrir les guillemets », « citation » | « fermez les guillemets », « fermer les guillemets », « fin de citation » | `« … »` |
+
+Marker matching is case-insensitive and tolerates the commas Whisper tends to insert. It's always on and only changes text when you actually speak a marker.
 
 ## How it works
 

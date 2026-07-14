@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPrefer
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
+const { applyDictationMarkers } = require('../shared/dictation')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -339,8 +340,9 @@ async function loadModel(modelName, force = false) {
 async function transcribe(pcm) {
   if (!whisperPipeline) return ''
 
+  const language = /** @type {string} */ (store.get('language', 'german'))
   const genOptions = {
-    language: store.get('language', 'german'),
+    language,
     task: 'transcribe',
     // Whisper internally processes only a fixed 30s window - without chunking
     // everything after that is silently cut off. chunk_length_s enables
@@ -387,7 +389,9 @@ async function transcribe(pcm) {
   const t0 = Date.now()
   const result = await whisperPipeline(pcm, genOptions)
   log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
-  return result.text.trim()
+  // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
+  // typographic quotes for the current language (see dictation.js).
+  return applyDictationMarkers(result.text.trim(), language)
 }
 
 // ── HF token (encrypted via the OS keychain) ───────────────────────────────────
