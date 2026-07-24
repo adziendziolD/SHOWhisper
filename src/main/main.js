@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, safeStorage, globalShortcut } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, globalShortcut } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
@@ -72,15 +72,11 @@ let isRecording = false        // hotkey toggle state (⌥Space starts/stops rec
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
 // Supported transcription languages (Whisper language names)
 const LANGUAGES = ['german', 'english', 'french']
-// Xenova model names (public, no HF token needed)
+// All models load from the public Xenova HuggingFace namespace, which hosts all
+// five sizes and needs no access token.
+const PROVIDER = 'Xenova'
 const MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 const MODEL_LABELS = { tiny: 'tiny (75 MB)', base: 'base (150 MB)', small: 'small (450 MB)', medium: 'medium (1.5 GB)', large: 'large (3 GB)' }
-// onnx-community only hosts tiny/base/small - medium/large don't exist there
-// (404 on download). Xenova has all 5 sizes.
-const PROVIDER_MODELS = {
-  Xenova: MODELS,
-  'onnx-community': ['tiny', 'base', 'small'],
-}
 
 // ── Overlay Window ────────────────────────────────────────────────────────────
 
@@ -172,19 +168,7 @@ async function loadModel(modelName, force = false) {
     const { pipeline, env } = await import('@huggingface/transformers')
 
     env.cacheDir = MODEL_CACHE_DIR
-    const hfToken = getHfToken()
-    if (hfToken) {
-      // since transformers.js v4 there's no env.authToken anymore, instead a
-      // custom fetch wrapper that sets the Authorization header
-      env.fetch = (url, options) => fetch(url, {
-        ...options,
-        headers: { ...options?.headers, Authorization: `Bearer ${hfToken}` },
-      })
-      log('HF token set')
-    }
-
-    const provider = store.get('provider', 'Xenova')
-    const modelId  = `${provider}/whisper-${modelName}`
+    const modelId  = `${PROVIDER}/whisper-${modelName}`
     log(`Loading model: ${modelId}`)
     log(`Cache dir:    ${MODEL_CACHE_DIR}`)
 
@@ -311,8 +295,7 @@ async function loadModel(modelName, force = false) {
     updateTrayLabel(tr('tray.loadError'))
 
     // Delete the corrupt cache so the next attempt downloads fresh
-    const provider    = /** @type {string} */ (store.get('provider', 'Xenova'))
-    const corruptPath = path.join(MODEL_CACHE_DIR, provider, `whisper-${modelName}`)
+    const corruptPath = path.join(MODEL_CACHE_DIR, PROVIDER, `whisper-${modelName}`)
     if (fs.existsSync(corruptPath)) {
       fs.rmSync(corruptPath, { recursive: true, force: true })
       log('Deleted corrupt cache:', corruptPath)
@@ -327,7 +310,7 @@ async function loadModel(modelName, force = false) {
     if (!settingsWindow || settingsWindow.isDestroyed()) {
       dialog.showErrorBox(
         tr('dialog.modelError.title'),
-        tr('dialog.modelError.body', { model: `${provider}/whisper-${modelName}`, error: errMsg(err) })
+        tr('dialog.modelError.body', { model: `${PROVIDER}/whisper-${modelName}`, error: errMsg(err) })
       )
     }
   } finally {
@@ -394,34 +377,6 @@ async function transcribe(pcm) {
   return applyDictationMarkers(result.text.trim(), language)
 }
 
-// ── HF token (encrypted via the OS keychain) ───────────────────────────────────
-// Don't store the HuggingFace token in plaintext in the electron-store JSON.
-// safeStorage uses the system keychain (macOS) / DPAPI (Windows). If
-// encryption isn't available (e.g. Linux without a keyring), fall back to
-// plaintext so the feature doesn't fail entirely.
-function setHfToken(token) {
-  store.delete('hfToken') // remove any old plaintext value (migration)
-  if (!token) { store.delete('hfTokenEnc'); return }
-  if (safeStorage.isEncryptionAvailable()) {
-    store.set('hfTokenEnc', safeStorage.encryptString(token).toString('base64'))
-  } else {
-    store.set('hfToken', token)
-  }
-}
-
-function getHfToken() {
-  const enc = /** @type {string} */ (store.get('hfTokenEnc', ''))
-  if (enc) {
-    try {
-      return safeStorage.decryptString(Buffer.from(enc, 'base64'))
-    } catch (e) {
-      logErr('Could not decrypt HF token:', errMsg(e))
-      return ''
-    }
-  }
-  return store.get('hfToken', '') // fallback / migration from old plaintext
-}
-
 // ── Settings Window ──────────────────────────────────────────────────────────
 
 function openSettings() {
@@ -468,12 +423,6 @@ ipcMain.on('settings-resize', (_e, height) => {
   if (currentH !== clamped) settingsWindow.setContentSize(w, clamped)
 })
 
-ipcMain.handle('settings-get', () => ({
-  provider: store.get('provider', 'Xenova'),
-  hfToken:  getHfToken(),
-  language: store.get('language', 'german'),
-}))
-
 // Transcription language is a per-transcribe option, not baked into the loaded
 // model - so save it instantly on change, no model reload needed.
 ipcMain.on('set-language', (_e, lang) => {
@@ -492,28 +441,6 @@ ipcMain.handle('get-language', () => store.get('language', 'german'))
 // Renderers are sandboxed and can't require('./i18n'), so hand them the whole
 // dictionary synchronously at preload time; they run the same small t() locally.
 ipcMain.on('i18n-sync', (e) => { e.returnValue = translations })
-
-// Open an external link (the HF token page from the settings). A dedicated
-// channel instead of mixing it into settings-save; only allow https so no
-// arbitrary scheme (file://, etc.) can be opened from the renderer.
-ipcMain.on('shell-open', (_e, url) => {
-  if (typeof url === 'string' && /^https:\/\//i.test(url)) shell.openExternal(url)
-})
-
-ipcMain.handle('settings-save', async (_e, data) => {
-  log('Settings gespeichert:', { provider: data.provider, hasToken: !!data.hfToken })
-  store.set('provider', data.provider)
-  setHfToken(data.hfToken)
-
-  // Reload the model with the new settings. force=true bypasses the "already
-  // loading" guard; any still-running load is discarded cleanly via the
-  // loadGeneration (no manual isLoadingModel reset needed anymore, that was
-  // previously the cause of the race). whisperPipeline set to null so we don't
-  // transcribe with the old model during the reload.
-  whisperPipeline = null
-  const currentModel = store.get('model', 'small')
-  await loadModel(currentModel, true)
-})
 
 // ── Model cache ────────────────────────────────────────────────────────────────
 // Cached models live as `<provider>/whisper-<model>/` folders under
@@ -538,7 +465,7 @@ function getDirSize(dir) {
 // deletable (would force a re-download on the next dictation, or corrupt an
 // in-progress download).
 function isModelLocked(provider, model) {
-  return provider === store.get('provider', 'Xenova') &&
+  return provider === PROVIDER &&
          model === store.get('model', 'small') &&
          (whisperPipeline !== null || isLoadingModel)
 }
@@ -689,9 +616,7 @@ function updateTrayLabel(label) {
 
 function buildTrayMenu() {
   const currentModel = store.get('model', 'small')
-  const provider = store.get('provider', 'Xenova')
-  const availableModels = PROVIDER_MODELS[provider] || MODELS
-  const modelItems = availableModels.map((m) => ({
+  const modelItems = MODELS.map((m) => /** @type {import('electron').MenuItemConstructorOptions} */ ({
     label: MODEL_LABELS[m] || m,
     type: 'radio',
     checked: m === currentModel,
@@ -824,6 +749,11 @@ app.whenReady().then(async () => {
 
   const { default: Store } = await import('electron-store')
   store = new Store()
+
+  // Migration: the provider/HF-token settings were removed (all models now load
+  // from the public Xenova namespace). Drop the now-unused keys so nothing dead
+  // lingers in the store.
+  for (const key of ['provider', 'hfToken', 'hfTokenEnc']) store.delete(key)
 
   log(`SHOWhisper starting (isDev=${isDev})`)
   log(`userData: ${app.getPath('userData')}`)

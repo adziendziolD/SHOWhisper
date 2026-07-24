@@ -14,10 +14,8 @@ function t(lang, key, vars) {
 contextBridge.exposeInMainWorld('i18n', { t })
 
 contextBridge.exposeInMainWorld('settings', {
-  get:               ()     => ipcRenderer.invoke('settings-get'),
-  save:              (data) => ipcRenderer.invoke('settings-save', data),
+  getLanguage:       ()   => ipcRenderer.invoke('get-language'),
   setLanguage:       (lang) => ipcRenderer.send('set-language', lang),
-  openExternal:      (url)  => ipcRenderer.send('shell-open', url),
   onProgress:        (cb) => ipcRenderer.on('model-progress', (_e, data) => cb(data)),
   onLanguageChanged: (cb) => ipcRenderer.on('language-changed', (_e, lang) => cb(lang)),
   cacheList:         ()               => ipcRenderer.invoke('cache-list'),

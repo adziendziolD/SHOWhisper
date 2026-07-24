@@ -80,7 +80,7 @@ Choose in the tray menu. Larger models are more accurate (especially for German)
 | medium    | 1.5 GB | ~2.5 GB | ~6–8 s       | ✅✅✅  |
 | large     | 3 GB   | ~4.5 GB | ~15 s        | 🏆      |
 
-Default: `small`. Models are loaded from the [`Xenova`](https://huggingface.co/Xenova) HuggingFace namespace by default (public, no token). You can switch the provider or add a HuggingFace read-token in **Settings** (the token is stored encrypted via the OS keychain).
+Default: `small`. Models are loaded from the public [`Xenova`](https://huggingface.co/Xenova) HuggingFace namespace, which hosts all five sizes and needs no access token. Pick the model in the tray menu.
 
 > **Language:** German, English and French are selectable in **Settings**, and the whole UI localizes to the chosen language.
 

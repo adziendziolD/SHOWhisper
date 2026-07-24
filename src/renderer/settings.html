@@ -37,7 +37,7 @@
       margin-bottom: 6px;
     }
 
-    select, input {
+    select {
       width: 100%;
       padding: 8px 10px;
       background: #1e1e22;
@@ -49,7 +49,7 @@
       transition: border-color 0.15s;
     }
 
-    select:focus, input:focus {
+    select:focus {
       border-color: #5b5bd6;
     }
 
@@ -73,12 +73,6 @@
       margin: 20px 0;
     }
 
-    .actions {
-      display: flex;
-      gap: 8px;
-      justify-content: flex-end;
-    }
-
     button {
       padding: 8px 18px;
       border-radius: 8px;
@@ -90,16 +84,6 @@
     }
 
     button:hover { opacity: 0.85; }
-
-    #btn-cancel {
-      background: #2e2e34;
-      color: #e8e8ea;
-    }
-
-    #btn-save {
-      background: #5b5bd6;
-      color: #fff;
-    }
 
     #status {
       font-size: 12px;
@@ -246,31 +230,6 @@
     <p class="hint"><span data-i18n="settings.language.hint">Sprache, in der du sprichst und die transkribiert wird.</span> <span id="lang-status"></span></p>
   </div>
 
-  <div class="field">
-    <label data-i18n="settings.provider.label">Modell-Provider</label>
-    <select id="provider">
-      <option value="Xenova" data-i18n="settings.provider.xenova">Xenova (public, kein Token nötig)</option>
-      <option value="onnx-community" data-i18n="settings.provider.onnx">onnx-community (neuere Modelle, Token empfohlen)</option>
-    </select>
-    <p class="hint" data-i18n="settings.provider.hint">Bestimmt von welchem HuggingFace-Namespace die Whisper-Modelle geladen werden.</p>
-  </div>
-
-  <div class="field">
-    <label data-i18n="settings.token.label">HuggingFace Read-Token</label>
-    <input type="password" id="hf-token" placeholder="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off"/>
-    <p class="hint">
-      <span data-i18n="settings.token.hint">Nur nötig für onnx-community oder gated models.</span>
-      <a onclick="openHF()" data-i18n="settings.token.create">Token erstellen →</a>
-    </p>
-  </div>
-
-  <div class="divider"></div>
-
-  <div class="actions">
-    <button id="btn-cancel" data-i18n="btn.cancel">Abbrechen</button>
-    <button id="btn-save" data-i18n="btn.save">Speichern &amp; Modell neu laden</button>
-  </div>
-
   <div id="progress-section">
     <div id="progress-label" data-i18n="overlay.loading">Modell wird geladen…</div>
     <div class="progress-bar-track">
@@ -316,11 +275,9 @@
     }
 
     async function init() {
-      const cfg = await window.settings.get()
-      applyI18n(cfg.language || 'german')
-      document.getElementById('language').value   = cfg.language || 'german'
-      document.getElementById('provider').value   = cfg.provider || 'Xenova'
-      document.getElementById('hf-token').value   = cfg.hfToken  || ''
+      const lang = await window.settings.getLanguage()
+      applyI18n(lang || 'german')
+      document.getElementById('language').value = lang || 'german'
       refreshCache()
     }
 
@@ -387,23 +344,6 @@
       renderCache(await window.settings.cacheClear())
     })
 
-    function openHF() {
-      // shell.openExternal isn't available in the renderer without nodeIntegration
-      // -> open it via the dedicated shell-open channel in the main process
-      window.settings.openExternal('https://huggingface.co/settings/tokens')
-    }
-
-    document.getElementById('btn-save').addEventListener('click', async () => {
-      const provider = document.getElementById('provider').value
-      const hfToken  = document.getElementById('hf-token').value.trim()
-
-      document.getElementById('btn-save').disabled   = true
-      document.getElementById('btn-cancel').disabled = true
-      document.getElementById('progress-section').classList.add('visible')
-
-      await window.settings.save({ provider, hfToken })
-    })
-
     window.settings.onProgress((data) => {
       const section = document.getElementById('progress-section')
       const fill    = document.getElementById('progress-bar-fill')
@@ -422,19 +362,18 @@
         pct.textContent    = '100%'
         status.textContent = T('status.modelLoaded')
         refreshCache() // show the freshly loaded model in the cache list
-        setTimeout(() => window.close(), 900)
+        // Clear the transient status/progress after a moment; the settings
+        // window stays open (a download here is triggered from the tray menu,
+        // not by this window).
+        setTimeout(() => { section.classList.remove('visible'); status.textContent = '' }, 1500)
       }
 
       if (data.status === 'error') {
         section.classList.remove('visible')
         status.style.color     = '#f87171'
         status.textContent     = T('status.error', { error: data.message || T('dialog.modelError.title') })
-        document.getElementById('btn-save').disabled   = false
-        document.getElementById('btn-cancel').disabled = false
       }
     })
-
-    document.getElementById('btn-cancel').addEventListener('click', () => window.close())
 
     // Language is saved instantly on change (no model reload needed).
     document.getElementById('language').addEventListener('change', (e) => {
