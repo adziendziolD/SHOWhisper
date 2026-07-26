@@ -124,6 +124,30 @@
       margin-right: 6px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    #progress { display: none; margin-bottom: 12px; }
+    #progress.visible { display: block; }
+    .progress-track {
+      height: 5px;
+      background: #2e2e34;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #5b5bd6, #7c7ce0);
+      border-radius: 999px;
+      transition: width 0.2s ease;
+    }
+    .progress-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 6px;
+    }
+    #progress-pct { font-size: 11px; color: #555; }
+    #btn-stop { padding: 4px 12px; font-size: 11px; background: #3a2226; color: #f87171; }
   </style>
 </head>
 <body>
@@ -141,6 +165,14 @@
   </div>
 
   <div id="status"></div>
+
+  <div id="progress">
+    <div class="progress-track"><div id="progress-fill"></div></div>
+    <div class="progress-row">
+      <span id="progress-pct">0%</span>
+      <button id="btn-stop" data-i18n="result.stop">Stoppen</button>
+    </div>
+  </div>
 
   <div id="transcript-section" class="section hidden">
     <div class="row">
@@ -199,6 +231,22 @@
       setTimeout(() => span.remove(), 1500)
     }
 
+    function setProgress(pct) {
+      $('progress').classList.add('visible')
+      $('btn-stop').disabled = false
+      const p = Math.max(0, Math.min(100, Math.round(pct)))
+      $('progress-fill').style.width = `${p}%`
+      $('progress-pct').textContent = `${p}%`
+    }
+    function hideProgress() { $('progress').classList.remove('visible') }
+
+    // Stop the running transcription.
+    $('btn-stop').addEventListener('click', () => {
+      $('btn-stop').disabled = true
+      setBusyStatus(T('result.stopping'))
+      window.result.cancel()
+    })
+
     // ── File status from main ─────────────────────────────────────────────────
     window.result.onFileStatus((data) => {
       if (data.status === 'transcribing') {
@@ -206,15 +254,26 @@
         $('transcript-section').classList.add('hidden')
         $('summary-section').classList.add('hidden')
         setBusyStatus(T('result.transcribing', { name: data.name || '' }))
+        setProgress(data.progress || 0)
+      } else if (data.status === 'progress') {
+        setProgress(data.progress || 0)
       } else if (data.status === 'done') {
         $('file-model').disabled = false
+        hideProgress()
         setStatus('')
         $('transcript').value = data.transcript || ''
         $('transcript-section').classList.remove('hidden')
         $('summary-section').classList.add('hidden')
         $('btn-summarize').disabled = !data.transcript
+      } else if (data.status === 'cancelled') {
+        $('file-model').disabled = false
+        hideProgress()
+        $('transcript-section').classList.add('hidden')
+        $('summary-section').classList.add('hidden')
+        setStatus(T('result.cancelled'))
       } else if (data.status === 'error') {
         $('file-model').disabled = false
+        hideProgress()
         $('transcript-section').classList.add('hidden')
         setStatus(T('result.error', { error: data.message || '' }), true)
       }
@@ -224,6 +283,7 @@
     async function initModelSelect() {
       const cfg = await window.result.config()
       const sel = $('file-model')
+      let currentModel = cfg.fileModel
       sel.innerHTML = ''
       for (const m of cfg.models) {
         const opt = document.createElement('option')
@@ -232,8 +292,17 @@
         if (m === cfg.fileModel) opt.selected = true
         sel.appendChild(opt)
       }
-      // Changing the model re-transcribes the current file (main handles that).
-      sel.addEventListener('change', () => window.result.setFileModel(sel.value))
+      // Changing the model asks to download it if needed (main shows the prompt)
+      // and re-transcribes the current file. If the user declines, main returns
+      // the still-active model, so revert the dropdown to it.
+      sel.addEventListener('change', async () => {
+        const wanted = sel.value
+        sel.disabled = true
+        const applied = await window.result.setFileModel(wanted)
+        currentModel = applied
+        if (applied !== wanted) sel.value = applied
+        sel.disabled = false
+      })
     }
 
     // ── Summarize ─────────────────────────────────────────────────────────────

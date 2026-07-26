@@ -37,8 +37,17 @@ elog.transports.file.archiveLogFn = (file) => {
   }
 }
 
-function log(...args) { elog.info(...args) }
-function logErr(...args) { elog.error(...args) }
+// electron-log serializes args via JSON.stringify, which throws on BigInt
+// ("Do not know how to serialize a BigInt"). Whisper token ids arrive as
+// BigInt64Array, so sanitize defensively: BigInt -> string, big-int typed
+// arrays -> string arrays. Keeps any stray BigInt from ever crashing logging.
+function safeArg(a) {
+  if (typeof a === 'bigint') return a.toString()
+  if (a instanceof BigInt64Array || a instanceof BigUint64Array) return Array.from(a, (x) => x.toString())
+  return a
+}
+function log(...args) { elog.info(...args.map(safeArg)) }
+function logErr(...args) { elog.error(...args.map(safeArg)) }
 
 /**
  * Extract a human-readable message from an unknown thrown value.
@@ -46,6 +55,14 @@ function logErr(...args) { elog.error(...args) }
  * @returns {string}
  */
 function errMsg(e) { return e instanceof Error ? e.message : String(e) }
+
+// Marker error for a user-cancelled transcription (distinguished from real
+// failures so the UI can reset quietly instead of showing an error).
+function cancelledError() {
+  const e = /** @type {any} */ (new Error('cancelled'))
+  e.cancelled = true
+  return e
+}
 
 // electron-store is ESM-only since v9, main.js is CommonJS -> import it
 // dynamically once the app is ready (see app.whenReady()). Typed non-null:
@@ -71,6 +88,8 @@ let resultWindow = null        // file-transcription result window
 let lastFileStatus = null      // replayed to the result window once it's listening
 /** @type {string | null} */
 let lastFilePath = null        // remembered so a model change can re-transcribe it
+/** @type {any} */
+let activeStopper = null       // InterruptableStoppingCriteria of the running file transcription
 /** @type {any} */
 let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
 let isLoadingModel = false
@@ -338,10 +357,15 @@ async function loadModel(modelName, force = false) {
   }
 }
 
-async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline } = {}) {
+/**
+ * @param {Float32Array} pcm
+ * @param {{ maxNewTokens?: number, pipeline?: any, onProgress?: ((pct: number) => void) | null, stopper?: any }} [opts]
+ */
+async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline, onProgress = null, stopper = null } = {}) {
   if (!pipeline) return ''
 
   const language = /** @type {string} */ (store.get('language', 'german'))
+  const durationSeconds = pcm.length / 16000
   const genOptions = {
     language,
     task: 'transcribe',
@@ -357,9 +381,7 @@ async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline 
     max_new_tokens: maxNewTokens,
   }
 
-  // Verbose diagnostics (PCM stats + live token streamer) only in dev mode:
-  // in production this is pure log noise and would, among other things, write
-  // the recognized text token by token (privacy for a dictation app).
+  // Dev-only PCM stats (pure log noise in production).
   if (isDev) {
     let min = Infinity, max = -Infinity, sumAbs = 0
     for (let i = 0; i < pcm.length; i++) {
@@ -368,29 +390,57 @@ async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline 
       if (v > max) max = v
       sumAbs += Math.abs(v)
     }
-    log(`transcribe(): ${pcm.length} samples (${(pcm.length / 16000).toFixed(1)}s), ` +
+    log(`transcribe(): ${pcm.length} samples (${durationSeconds.toFixed(1)}s), ` +
         `min=${min.toFixed(3)} max=${max.toFixed(3)} avgAbs=${(sumAbs / pcm.length).toFixed(4)}`)
+  }
 
+  // Dev-only streamer for the recognized chunk text (token-level logging is
+  // intentionally omitted: it floods the log and the token ids are a
+  // BigInt64Array that electron-log can't serialize).
+  if (isDev) {
     const { WhisperTextStreamer } = await import('@huggingface/transformers')
-    const tStart = Date.now()
-    let lastTokenAt = tStart
-    let tokenCount = 0
     genOptions.streamer = new WhisperTextStreamer(pipeline.tokenizer, {
-      on_chunk_start: (x) => log(`  [streamer] Chunk start at ${x.toFixed(2)}s`),
-      token_callback_function: (tokens) => {
-        const now = Date.now()
-        tokenCount++
-        log(`  [streamer] Token #${tokenCount} (+${now - lastTokenAt}ms, total ${now - tStart}ms):`, tokens)
-        lastTokenAt = now
-      },
       callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
-      on_chunk_end: (x) => log(`  [streamer] Chunk end at ${x.toFixed(2)}s`),
       on_finalize: () => log(`  [streamer] Finalized`),
     })
   }
 
+  // Progress bar + cancellation (file transcription): the long-form pipeline
+  // calls model.generate() exactly once per 30s window. Wrap it to (a) count
+  // completed windows against the total for a real progress %, and (b) inject an
+  // InterruptableStoppingCriteria so a Stop button can abort mid-generation.
+  // WhisperTextStreamer's on_chunk_start can't drive progress - it only fires
+  // with return_timestamps and reports within-window time. This wrapper doesn't
+  // otherwise change transcription behaviour.
+  /** @type {(() => void) | null} */
+  let restoreGenerate = null
+  if (onProgress || stopper) {
+    const sr = WHISPER_SAMPLE_RATE
+    const window = sr * genOptions.chunk_length_s
+    const jump = window - 2 * sr * genOptions.stride_length_s
+    const totalChunks = pcm.length <= window ? 1 : Math.ceil((pcm.length - window) / jump) + 1
+    const model = pipeline.model
+    const origGenerate = model.generate.bind(model)
+    let done = 0
+    if (onProgress) onProgress(0)
+    model.generate = async (opts) => {
+      if (stopper?.interrupted) throw cancelledError()
+      const r = await origGenerate(stopper ? { ...opts, stopping_criteria: stopper } : opts)
+      if (stopper?.interrupted) throw cancelledError()  // interrupted mid-window
+      done += 1
+      if (onProgress) onProgress(Math.max(0, Math.min(99, Math.round((done / totalChunks) * 100))))
+      return r
+    }
+    restoreGenerate = () => { model.generate = origGenerate }
+  }
+
   const t0 = Date.now()
-  const result = await pipeline(pcm, genOptions)
+  let result
+  try {
+    result = await pipeline(pcm, genOptions)
+  } finally {
+    if (restoreGenerate) restoreGenerate()
+  }
   log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
   // typographic quotes for the current language (see dictation.js).
@@ -576,20 +626,21 @@ function getFileModel() {
 // Transcribe file PCM with the chosen model. If it's the active dictation model,
 // reuse the warm pipeline; otherwise build a temporary pipeline just for this
 // file and dispose it afterwards, leaving the dictation model loaded and active.
-async function transcribeFilePCM(pcm, modelName) {
+async function transcribeFilePCM(pcm, modelName, onProgress, stopper) {
   const activeModel = store.get('model', 'small')
   if (modelName === activeModel && whisperPipeline) {
-    return transcribe(pcm, { maxNewTokens: 2048 })
+    return transcribe(pcm, { maxNewTokens: 2048, onProgress, stopper })
   }
   overlayWindow?.showInactive()
   updateTrayLabel(tr('tray.loading', { model: modelName }))
   /** @type {any} */ let tempPipe = null
   try {
     tempPipe = await buildWhisperPipeline(modelName, makeProgressCallback(modelName))
+    if (stopper?.interrupted) throw cancelledError()  // cancelled during download
     sendModelProgress({ status: 'ready' })
     updateTrayLabel(null)
     setTimeout(() => overlayWindow?.hide(), 300)
-    return await transcribe(pcm, { maxNewTokens: 2048, pipeline: tempPipe })
+    return await transcribe(pcm, { maxNewTokens: 2048, pipeline: tempPipe, onProgress, stopper })
   } finally {
     updateTrayLabel(null)
     // Free the temporary model's native memory; best-effort (older transformers
@@ -607,16 +658,27 @@ async function transcribeFileFlow(filePath) {
   openResultWindow()
   lastFilePath = filePath
   const model = getFileModel()
-  sendFileStatus({ status: 'transcribing', name: path.basename(filePath), model })
+  const { InterruptableStoppingCriteria } = await import('@huggingface/transformers')
+  const stopper = new InterruptableStoppingCriteria()
+  activeStopper = stopper
+  sendFileStatus({ status: 'transcribing', name: path.basename(filePath), model, progress: 0 })
   try {
     const pcm = await decodeFileToWhisperPCM(filePath)
     log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)} (model: ${model})`)
-    const transcript = await transcribeFilePCM(pcm, model)
+    const onProgress = (p) => sendFileStatus({ status: 'progress', progress: p })
+    const transcript = await transcribeFilePCM(pcm, model, onProgress, stopper)
     log(isDev ? `File transcription: "${transcript}"` : `File transcription done (${transcript.length} chars)`)
     sendFileStatus({ status: 'done', name: path.basename(filePath), transcript, model })
   } catch (err) {
-    logErr('File transcription error:', errMsg(err))
-    sendFileStatus({ status: 'error', message: errMsg(err) })
+    if (/** @type {any} */ (err)?.cancelled) {
+      log('File transcription cancelled')
+      sendFileStatus({ status: 'cancelled' })
+    } else {
+      logErr('File transcription error:', errMsg(err))
+      sendFileStatus({ status: 'error', message: errMsg(err) })
+    }
+  } finally {
+    if (activeStopper === stopper) activeStopper = null
   }
 }
 
@@ -649,6 +711,15 @@ ipcMain.on('result-drop-file', (_e, filePath) => {
 
 ipcMain.on('result-open-file', () => openFileForTranscription())
 
+// Stop button: interrupt the running file transcription. The generate wrapper
+// checks the criteria per token and aborts at the next opportunity.
+ipcMain.on('result-cancel', () => {
+  if (activeStopper) {
+    log('File transcription: stop requested')
+    activeStopper.interrupt()
+  }
+})
+
 // Model selector in the result window: expose the choices + current selection.
 ipcMain.handle('result-config', () => ({
   models: MODELS,
@@ -656,13 +727,63 @@ ipcMain.handle('result-config', () => ({
   fileModel: getFileModel(),
 }))
 
-// Change the file-transcription model and, if a file is already loaded,
-// re-transcribe it with the new model.
-ipcMain.on('result-set-file-model', (_e, model) => {
-  if (!MODELS.includes(model)) return
+// True if the model's weights are already on disk (not just a metadata stub).
+// Even a "tiny" model is tens of MB, so a small threshold reliably tells an
+// uncached/partial folder from a real one.
+function isModelCached(model) {
+  const dir = safeModelDir(PROVIDER, model)
+  if (!dir || !fs.existsSync(dir)) return false
+  return getDirSize(dir) > 5_000_000
+}
+
+// Download a file model in the background (no file loaded yet) so it's ready for
+// the next transcription. Progress shows in the overlay pill; the pipeline is
+// disposed right after - we only wanted to warm the on-disk cache.
+async function preloadFileModel(model) {
+  overlayWindow?.showInactive()
+  updateTrayLabel(tr('tray.loading', { model }))
+  /** @type {any} */ let pipe = null
+  try {
+    pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+    sendModelProgress({ status: 'ready' })
+  } catch (err) {
+    logErr('File model preload error:', errMsg(err))
+    sendModelProgress({ status: 'error', message: errMsg(err) })
+  } finally {
+    updateTrayLabel(null)
+    setTimeout(() => overlayWindow?.hide(), 500)
+    if (pipe && typeof pipe.dispose === 'function') { try { await pipe.dispose() } catch { /* gone */ } }
+  }
+}
+
+// Change the file-transcription model. If the model isn't downloaded yet, ask
+// for confirmation first (the download can be large). Returns the model that is
+// now in effect, so the renderer can revert its dropdown if the user declined.
+ipcMain.handle('result-set-file-model', async (_e, model) => {
+  if (!MODELS.includes(model)) return getFileModel()
+
+  if (!isModelCached(model)) {
+    const opts = /** @type {import('electron').MessageBoxOptions} */ ({
+      type: 'question',
+      buttons: [tr('dialog.downloadModel.download'), tr('dialog.downloadModel.cancel')],
+      defaultId: 0,
+      cancelId: 1,
+      title: tr('dialog.downloadModel.title'),
+      message: tr('dialog.downloadModel.message', { model: MODEL_LABELS[model] || model }),
+    })
+    const win = resultWindow && !resultWindow.isDestroyed() ? resultWindow : null
+    const { response } = await (win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts))
+    if (response !== 0) return getFileModel() // declined -> keep current model
+  }
+
   store.set('fileModel', model)
   log('File model set:', model)
-  if (lastFilePath) transcribeFileFlow(lastFilePath)
+  if (lastFilePath) {
+    transcribeFileFlow(lastFilePath)          // re-transcribes (downloads if needed)
+  } else if (!isModelCached(model)) {
+    preloadFileModel(model)                   // no file yet -> download now as confirmed
+  }
+  return model
 })
 
 ipcMain.on('result-copy', (_e, text) => {
@@ -954,7 +1075,7 @@ function buildTrayMenu() {
   const menu = Menu.buildFromTemplate([
     { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
-    { label: tr('menu.transcribeFile'), click: openFileForTranscription },
+    { label: tr('menu.transcribeFile'), click: () => openResultWindow() },
     { label: tr('menu.settings'), click: openSettings },
     {
       label: tr('menu.autostart'),
