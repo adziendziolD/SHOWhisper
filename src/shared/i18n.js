@@ -8,12 +8,14 @@
 
 const translations = {
   german: {
+    'menu.transcribeFile': 'Datei transkribieren…',
     'menu.settings': 'Einstellungen…',
     'menu.autostart': 'Beim Anmelden starten',
     'menu.model': 'Modell',
     'menu.quit': 'Beenden',
 
     'tray.loading': 'Lade {model}…',
+    'tray.loadingLlm': 'Lade Zusammenfassungs-Modell…',
     'tray.loadError': 'Fehler beim Laden',
     'tray.hotkeyUnavailable': 'Hotkey ⌥Leertaste belegt',
 
@@ -29,6 +31,7 @@ const translations = {
 
     'overlay.loading': 'Modell wird geladen…',
     'overlay.transcribing': 'Wird transkribiert…',
+    'overlay.summarizing': 'Wird zusammengefasst…',
 
     'settings.title': 'SHOWhisper – Einstellungen',
     'settings.heading': '🎙 SHOWhisper – Einstellungen',
@@ -52,15 +55,34 @@ const translations = {
     'status.saved': '✓ gespeichert',
     'status.error': '⚠️ Fehler: {error}',
     'error.unknown': 'Unbekannter Fehler',
+
+    'result.heading': '🎙 SHOWhisper – Datei-Transkription',
+    'result.drop': 'Mediendatei hierher ziehen oder auswählen',
+    'result.dropHint': 'mp4, mov, mp3, m4a, wav …',
+    'result.transcribing': '{name} wird transkribiert…',
+    'result.transcript': 'Transkript',
+    'result.summary': 'Zusammenfassung',
+    'result.summarize': 'Zusammenfassen',
+    'result.summarizing': 'Wird zusammengefasst…',
+    'result.copy': 'Kopieren',
+    'result.save': 'Speichern…',
+    'result.copied': '✓ kopiert',
+    'result.saved': '✓ gespeichert',
+    'result.error': '⚠️ Fehler: {error}',
+    'result.modelNotReady': 'Das Transkriptionsmodell wird noch geladen. Bitte kurz warten und erneut versuchen.',
+    'result.unsupported': 'Dieses Dateiformat wird nicht unterstützt.',
+    'result.mediaFilter': 'Mediendateien',
   },
 
   english: {
+    'menu.transcribeFile': 'Transcribe file…',
     'menu.settings': 'Settings…',
     'menu.autostart': 'Launch at login',
     'menu.model': 'Model',
     'menu.quit': 'Quit',
 
     'tray.loading': 'Loading {model}…',
+    'tray.loadingLlm': 'Loading summary model…',
     'tray.loadError': 'Load failed',
     'tray.hotkeyUnavailable': 'Hotkey ⌥Space unavailable',
 
@@ -76,6 +98,7 @@ const translations = {
 
     'overlay.loading': 'Loading model…',
     'overlay.transcribing': 'Transcribing…',
+    'overlay.summarizing': 'Summarizing…',
 
     'settings.title': 'SHOWhisper – Settings',
     'settings.heading': '🎙 SHOWhisper – Settings',
@@ -99,15 +122,34 @@ const translations = {
     'status.saved': '✓ Saved',
     'status.error': '⚠️ Error: {error}',
     'error.unknown': 'Unknown error',
+
+    'result.heading': '🎙 SHOWhisper – File transcription',
+    'result.drop': 'Drag a media file here or choose one',
+    'result.dropHint': 'mp4, mov, mp3, m4a, wav …',
+    'result.transcribing': 'Transcribing {name}…',
+    'result.transcript': 'Transcript',
+    'result.summary': 'Summary',
+    'result.summarize': 'Summarize',
+    'result.summarizing': 'Summarizing…',
+    'result.copy': 'Copy',
+    'result.save': 'Save…',
+    'result.copied': '✓ copied',
+    'result.saved': '✓ saved',
+    'result.error': '⚠️ Error: {error}',
+    'result.modelNotReady': 'The transcription model is still loading. Please wait a moment and try again.',
+    'result.unsupported': 'This file format is not supported.',
+    'result.mediaFilter': 'Media files',
   },
 
   french: {
+    'menu.transcribeFile': 'Transcrire un fichier…',
     'menu.settings': 'Réglages…',
     'menu.autostart': 'Lancer à la connexion',
     'menu.model': 'Modèle',
     'menu.quit': 'Quitter',
 
     'tray.loading': 'Chargement de {model}…',
+    'tray.loadingLlm': 'Chargement du modèle de résumé…',
     'tray.loadError': 'Échec du chargement',
     'tray.hotkeyUnavailable': 'Raccourci ⌥Espace indisponible',
 
@@ -123,6 +165,7 @@ const translations = {
 
     'overlay.loading': 'Chargement du modèle…',
     'overlay.transcribing': 'Transcription…',
+    'overlay.summarizing': 'Résumé en cours…',
 
     'settings.title': 'SHOWhisper – Réglages',
     'settings.heading': '🎙 SHOWhisper – Réglages',
@@ -146,6 +189,23 @@ const translations = {
     'status.saved': '✓ Enregistré',
     'status.error': '⚠️ Erreur : {error}',
     'error.unknown': 'Erreur inconnue',
+
+    'result.heading': '🎙 SHOWhisper – Transcription de fichier',
+    'result.drop': 'Glissez un fichier média ici ou sélectionnez-en un',
+    'result.dropHint': 'mp4, mov, mp3, m4a, wav …',
+    'result.transcribing': 'Transcription de {name}…',
+    'result.transcript': 'Transcription',
+    'result.summary': 'Résumé',
+    'result.summarize': 'Résumer',
+    'result.summarizing': 'Résumé en cours…',
+    'result.copy': 'Copier',
+    'result.save': 'Enregistrer…',
+    'result.copied': '✓ copié',
+    'result.saved': '✓ enregistré',
+    'result.error': '⚠️ Erreur : {error}',
+    'result.modelNotReady': 'Le modèle de transcription est encore en cours de chargement. Veuillez patienter et réessayer.',
+    'result.unsupported': 'Ce format de fichier n\'est pas pris en charge.',
+    'result.mediaFilter': 'Fichiers média',
   },
 }
 

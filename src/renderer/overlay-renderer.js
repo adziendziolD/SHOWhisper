@@ -189,6 +189,7 @@ async function stopRecording() {
 window.whisper.onStartRecording(() => startRecording())
 window.whisper.onStopRecording(()  => stopRecording())
 window.whisper.onTranscribing(()   => setState('transcribing'))
+window.whisper.onSummarizing(()    => setState('summarizing'))
 window.whisper.onDone(()           => setState('done'))
 window.whisper.onModelLoading(handleModelLoading)
 

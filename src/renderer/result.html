@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8"/>
+  <title>SHOWhisper – Datei-Transkription</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #111113;
+      color: #e8e8ea;
+      padding: 24px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #fff;
+      letter-spacing: -0.01em;
+    }
+
+    label {
+      display: block;
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #888;
+      margin-bottom: 6px;
+    }
+
+    /* Drop zone / picker */
+    #dropzone {
+      border: 1.5px dashed #33333a;
+      border-radius: 12px;
+      padding: 22px;
+      text-align: center;
+      color: #888;
+      transition: border-color 0.15s, background 0.15s;
+      cursor: pointer;
+      margin-bottom: 16px;
+    }
+    #dropzone.drag { border-color: #5b5bd6; background: #17171d; color: #cfcfe6; }
+    #dropzone .hint { font-size: 11px; color: #555; margin-top: 4px; }
+
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      padding: 10px 12px;
+      background: #1a1a1f;
+      border: 1px solid #2e2e34;
+      border-radius: 8px;
+      color: #e8e8ea;
+      font: inherit;
+      font-size: 13px;
+      line-height: 1.55;
+      outline: none;
+    }
+    textarea:focus { border-color: #5b5bd6; }
+
+    .section { margin-bottom: 18px; }
+    .section.hidden { display: none; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .row .tools { display: flex; gap: 6px; }
+
+    button {
+      padding: 6px 14px;
+      border-radius: 8px;
+      border: none;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      background: #2e2e34;
+      color: #e8e8ea;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    button.primary { background: #5b5bd6; color: #fff; }
+
+    #status {
+      font-size: 12px;
+      color: #888;
+      min-height: 18px;
+      margin-bottom: 12px;
+    }
+    #status.error { color: #f87171; }
+    .flash { color: #4ade80; font-size: 11px; margin-left: 4px; }
+
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid #444;
+      border-top-color: #5b5bd6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: -2px;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1 data-i18n="result.heading">🎙 SHOWhisper – Datei-Transkription</h1>
+
+  <div id="dropzone">
+    <div data-i18n="result.drop">Mediendatei hierher ziehen oder auswählen</div>
+    <div class="hint" data-i18n="result.dropHint">mp4, mov, mp3, m4a, wav …</div>
+  </div>
+
+  <div id="status"></div>
+
+  <div id="transcript-section" class="section hidden">
+    <div class="row">
+      <label style="margin:0" data-i18n="result.transcript">Transkript</label>
+      <div class="tools">
+        <button id="btn-summarize" class="primary" data-i18n="result.summarize">Zusammenfassen</button>
+        <button id="btn-copy-t" data-i18n="result.copy">Kopieren</button>
+        <button id="btn-save-t" data-i18n="result.save">Speichern…</button>
+      </div>
+    </div>
+    <textarea id="transcript" spellcheck="false"></textarea>
+  </div>
+
+  <div id="summary-section" class="section hidden">
+    <div class="row">
+      <label style="margin:0" data-i18n="result.summary">Zusammenfassung</label>
+      <div class="tools">
+        <button id="btn-copy-s" data-i18n="result.copy">Kopieren</button>
+        <button id="btn-save-s" data-i18n="result.save">Speichern…</button>
+      </div>
+    </div>
+    <textarea id="summary" spellcheck="false"></textarea>
+  </div>
+
+  <script>
+    let currentLang = 'german'
+    const T = (key, vars) => window.i18n.t(currentLang, key, vars)
+    const $ = (id) => document.getElementById(id)
+
+    function applyI18n(lang) {
+      currentLang = lang
+      document.querySelectorAll('[data-i18n]').forEach((el) => {
+        el.textContent = T(el.dataset.i18n)
+      })
+    }
+
+    function setStatus(text, isError) {
+      const s = $('status')
+      s.innerHTML = ''
+      s.className = isError ? 'error' : ''
+      if (text) s.textContent = text
+    }
+
+    function setBusyStatus(text) {
+      const s = $('status')
+      s.className = ''
+      s.innerHTML = '<span class="spinner"></span>'
+      s.appendChild(document.createTextNode(text))
+    }
+
+    function flash(afterEl, key) {
+      const span = document.createElement('span')
+      span.className = 'flash'
+      span.textContent = T(key)
+      afterEl.parentElement.appendChild(span)
+      setTimeout(() => span.remove(), 1500)
+    }
+
+    // ── File status from main ─────────────────────────────────────────────────
+    window.result.onFileStatus((data) => {
+      if (data.status === 'transcribing') {
+        $('transcript-section').classList.add('hidden')
+        $('summary-section').classList.add('hidden')
+        setBusyStatus(T('result.transcribing', { name: data.name || '' }))
+      } else if (data.status === 'done') {
+        setStatus('')
+        $('transcript').value = data.transcript || ''
+        $('transcript-section').classList.remove('hidden')
+        $('summary-section').classList.add('hidden')
+        $('btn-summarize').disabled = !data.transcript
+      } else if (data.status === 'error') {
+        $('transcript-section').classList.add('hidden')
+        setStatus(T('result.error', { error: data.message || '' }), true)
+      }
+    })
+
+    // ── Summarize ─────────────────────────────────────────────────────────────
+    $('btn-summarize').addEventListener('click', async () => {
+      const text = $('transcript').value.trim()
+      if (!text) return
+      $('btn-summarize').disabled = true
+      setBusyStatus(T('result.summarizing'))
+      try {
+        const summary = await window.result.summarize(text)
+        $('summary').value = summary || ''
+        $('summary-section').classList.remove('hidden')
+        setStatus('')
+      } catch (err) {
+        setStatus(T('result.error', { error: (err && err.message) || String(err) }), true)
+      } finally {
+        $('btn-summarize').disabled = false
+      }
+    })
+
+    // ── Copy / Save ───────────────────────────────────────────────────────────
+    $('btn-copy-t').addEventListener('click', (e) => { window.result.copy($('transcript').value); flash(e.target, 'result.copied') })
+    $('btn-copy-s').addEventListener('click', (e) => { window.result.copy($('summary').value); flash(e.target, 'result.copied') })
+    $('btn-save-t').addEventListener('click', async (e) => { if (await window.result.save($('transcript').value)) flash(e.target, 'result.saved') })
+    $('btn-save-s').addEventListener('click', async (e) => { if (await window.result.save($('summary').value)) flash(e.target, 'result.saved') })
+
+    // ── File picker + drag & drop ─────────────────────────────────────────────
+    $('dropzone').addEventListener('click', () => window.result.openFile())
+
+    const dz = $('dropzone')
+    ;['dragenter', 'dragover'].forEach((ev) => dz.addEventListener(ev, (e) => {
+      e.preventDefault(); e.stopPropagation(); dz.classList.add('drag')
+    }))
+    ;['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => {
+      e.preventDefault(); e.stopPropagation(); dz.classList.remove('drag')
+    }))
+    // Also swallow drops outside the zone so the window doesn't navigate to the file.
+    window.addEventListener('dragover', (e) => e.preventDefault())
+    window.addEventListener('drop', (e) => e.preventDefault())
+    dz.addEventListener('drop', (e) => {
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]
+      if (file) window.result.dropFile(file)
+    })
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    window.result.onLanguageChanged(applyI18n)
+    window.result.getLanguage().then((lang) => {
+      applyI18n(lang || 'german')
+      window.result.ready()
+    })
+  </script>
+</body>
+</html>

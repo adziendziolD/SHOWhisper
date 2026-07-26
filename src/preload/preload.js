@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('whisper', {
   onStartRecording: (cb) => ipcRenderer.on('start-recording', cb),
   onStopRecording:  (cb) => ipcRenderer.on('stop-recording', cb),
   onTranscribing:   (cb) => ipcRenderer.on('transcribing', cb),
+  onSummarizing:    (cb) => ipcRenderer.on('summarizing', cb),
   onDone:           (cb) => ipcRenderer.on('done', cb),
   onModelLoading:   (cb) => ipcRenderer.on('model-loading', (_e, data) => cb(data)),
   sendAudio:        (buffer) => ipcRenderer.send('audio-ready', buffer),

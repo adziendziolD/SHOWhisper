@@ -54,6 +54,7 @@ html, body {
 #state-loading,
 #state-recording,
 #state-transcribing,
+#state-summarizing,
 #state-done {
   display: none;
   align-items: center;
@@ -155,7 +156,8 @@ html, body {
   display: flex;
 }
 
-#spinner {
+#spinner,
+#spinner-sum {
   width: 18px;
   height: 18px;
   color: rgba(255,255,255,0.9);
@@ -164,6 +166,16 @@ html, body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Summarizing (local LLM) - a warmer indigo to distinguish it from transcribing */
+#pill.summarizing {
+  min-width: 240px;
+  background: rgba(80, 45, 130, 0.88);
+}
+
+#pill.summarizing #state-summarizing {
+  display: flex;
 }
 
 /* Done */

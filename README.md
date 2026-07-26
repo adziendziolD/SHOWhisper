@@ -10,7 +10,9 @@
 ## Features
 
 - 🎙️ **Global hotkey dictation** — press <kbd>⌥</kbd> <kbd>Space</kbd> to start, press again to stop. The transcript is pasted at your cursor.
-- 🔒 **Fully local & private** — transcription runs on-device via [Whisper](https://github.com/openai/whisper) (ONNX / [transformers.js](https://github.com/huggingface/transformers.js)). Audio never leaves your computer.
+- 🧠 **On-device summaries** — press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> instead and the dictation is summarized by a local LLM before it's pasted (the full transcript stays on your clipboard). Runs fully offline via [node-llama-cpp](https://node-llama-cpp.withcat.ai/).
+- 📁 **File transcription** — pick or drag in a media file (mp4, mov, mp3, m4a, wav …) and get a transcript in a result window, with an optional summary and copy/save.
+- 🔒 **Fully local & private** — transcription runs on-device via [Whisper](https://github.com/openai/whisper) (ONNX / [transformers.js](https://github.com/huggingface/transformers.js)), and summaries via a local GGUF model. Nothing leaves your computer.
 - 🪟 **Floating pill overlay** — a small, always-on-top capsule shows a live waveform while recording, progress while transcribing, and a ✓ when done. Drag it anywhere; its position is remembered.
 - 🍎 **Menubar app** — lives in the tray/menubar, no dock clutter. Pick your model from the menu.
 - ⚡ **Apple Silicon acceleration** — uses CoreML on macOS where available, with an automatic CPU fallback.
@@ -30,6 +32,29 @@ Example (German): saying *“Er sagte Zitat Anfang das ist unmöglich Zitat Ende
 | French   | « ouvrez les guillemets », « ouvrir les guillemets », « citation » | « fermez les guillemets », « fermer les guillemets », « fin de citation » | `« … »` |
 
 Marker matching is case-insensitive and tolerates the commas Whisper tends to insert. It's always on and only changes text when you actually speak a marker.
+
+## Summarizing your dictation
+
+Press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> (instead of <kbd>⌥</kbd> <kbd>Space</kbd>) to dictate **and** summarize. The audio is transcribed, then condensed by a local LLM in the same language, and the **summary** is pasted at your cursor while the **full transcript** is left on your clipboard.
+
+The summary runs fully offline. The first time you use it, a GGUF model is downloaded once (~2.5 GB) and cached under the app's user-data directory (`llm-cache`); after that it works with no network. The default model is [`Qwen3-4B-Instruct-2507`](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF) (a current, multilingual, non-thinking instruct model). To use a different model, set the store key `llmModelUri` to any node-llama-cpp `hf:owner/repo:quant` URI or a local `.gguf` path.
+
+> Summaries need noticeably more RAM than dictation (a 4B Q4 model uses roughly 2.5–3.5 GB). On a 16 GB machine, prefer a smaller Whisper model if you summarize a lot.
+
+## Transcribing a file
+
+Choose **Transcribe file…** from the tray menu, or drag a media file onto the result window. The file is decoded with a bundled ffmpeg (so any common container/codec works — mp4, mov, mkv, webm, mp3, m4a, wav, …) and transcribed with the same Whisper model. The result window shows the transcript with **Copy**, **Save…**, and a **Summarize** button (same local LLM as above).
+
+## Hotkeys
+
+Both hotkeys are global (work in any app) and toggle: press once to start recording, press again to stop. On macOS <kbd>⌥</kbd> is Option; on Windows it's <kbd>Alt</kbd>.
+
+| Hotkey | Action |
+|--------|--------|
+| <kbd>⌥</kbd> <kbd>Space</kbd> | **Dictate.** Transcribe your speech and paste it at the cursor. |
+| <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> | **Dictate + summarize.** Transcribe, summarize with the local LLM, paste the summary; the full transcript stays on the clipboard. |
+
+Not a hotkey, but handy: **drag the floating pill** to reposition it anywhere on screen — its position is remembered. Everything else (model choice, file transcription, settings, quit) is in the **tray/menubar menu**. Hotkeys are currently fixed and not yet configurable.
 
 ## How it works
 
@@ -56,6 +81,27 @@ On first launch macOS will ask for these permissions:
 |------------|-----|----------------|
 | **Microphone** | recording your voice (required) | System Settings → Privacy & Security → Microphone |
 | **Accessibility** | simulated paste of the transcript (optional: without it the text stays on the clipboard for a manual paste) | System Settings → Privacy & Security → Accessibility |
+
+## Installing the app (macOS `.dmg`)
+
+The `.dmg` is **ad-hoc signed but not notarized** (building a notarized release needs a paid Apple Developer account). It runs perfectly fine, but macOS Gatekeeper shows a warning on the very first launch that you have to click past **once**. This is expected — follow the steps below.
+
+1. **Download** `SHOWhisper-<version>-<arch>.dmg`. Pick `arm64` for Apple Silicon (M1/M2/M3/M4) or `x64` for Intel Macs.
+2. **Open the `.dmg`** and drag **SHOWhisper** into your **Applications** folder.
+3. **First launch — get past Gatekeeper.** Double-clicking will say *"SHOWhisper cannot be opened because Apple cannot check it for malicious software"* (or *"is damaged"* on Apple Silicon). Do **one** of these once:
+   - **Right-click** (or Control-click) the app in Applications → **Open** → **Open** in the dialog, **or**
+   - open it once normally, then go to **System Settings → Privacy & Security** and click **Open Anyway**, **or**
+   - run in Terminal: `xattr -cr /Applications/SHOWhisper.app` and open it normally.
+
+   After this one-time confirmation it launches like any other app.
+4. **Grant permissions** when prompted — **Microphone** (required) and, for auto-paste, **Accessibility** (see the table above).
+5. **First use downloads the models.** The Whisper model (default `small`, ~450 MB) downloads on first launch; the summarization model (~2.5 GB) downloads the first time you use <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd>. Both are cached locally and afterwards everything runs offline.
+
+> **Why the warning?** Ad-hoc signing is what avoids the harder "app is damaged" rejection on Apple Silicon, but only full notarization removes the prompt entirely. The app is open source — you can also build it yourself (below).
+
+### Windows (`.exe`)
+
+Run the NSIS installer. SmartScreen may show *"Windows protected your PC"* because the build isn't signed with a paid certificate — click **More info → Run anyway**.
 
 ## Getting started (from source)
 

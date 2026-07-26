@@ -3,6 +3,7 @@ const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
 const { applyDictationMarkers } = require('../shared/dictation')
+const { buildSystemPrompt, cleanSummary } = require('../shared/summarize')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -64,12 +65,17 @@ let tray                       // assigned in createTray() during whenReady
 let overlayWindow = null
 /** @type {import('electron').BrowserWindow | null} */
 let settingsWindow = null
+/** @type {import('electron').BrowserWindow | null} */
+let resultWindow = null        // file-transcription result window
+/** @type {any} */
+let lastFileStatus = null      // replayed to the result window once it's listening
 /** @type {any} */
 let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
 let isLoadingModel = false
 let loadGeneration = 0         // prevents a superseded load from overwriting state
 let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
+let pendingSummarize = false   // set when recording was started via the summarize hotkey
 // Supported transcription languages (Whisper language names)
 const LANGUAGES = ['german', 'english', 'french']
 // All models load from the public Xenova HuggingFace namespace, which hosts all
@@ -77,6 +83,17 @@ const LANGUAGES = ['german', 'english', 'french']
 const PROVIDER = 'Xenova'
 const MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 const MODEL_LABELS = { tiny: 'tiny (75 MB)', base: 'base (150 MB)', small: 'small (450 MB)', medium: 'medium (1.5 GB)', large: 'large (3 GB)' }
+
+// ── Local LLM (summarization, node-llama-cpp) ──────────────────────────────────
+// Optional, lazily loaded on first summarize. Stays fully offline/local. The
+// GGUF is downloaded once into userData/llm-cache (never bundled). Default is a
+// current (2025) multilingual instruct model; override via the store key
+// 'llmModelUri' (any node-llama-cpp `hf:owner/repo:quant` URI or local path).
+const DEFAULT_LLM_URI = 'hf:unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M'
+/** @type {any} */ let llama = null       // getLlama() runtime handle
+/** @type {any} */ let llmModel = null    // loaded GGUF model, kept warm between summaries
+let isLoadingLlm = false
+let llmBusy = false            // single context sequence -> one summarize at a time
 
 // ── Overlay Window ────────────────────────────────────────────────────────────
 
@@ -123,6 +140,8 @@ function createOverlay() {
 
 // Cache in the home directory, not in node_modules
 const MODEL_CACHE_DIR = path.join(app.getPath('userData'), 'model-cache')
+// Separate cache for the (optional, large) summarization GGUF.
+const LLM_CACHE_DIR = path.join(app.getPath('userData'), 'llm-cache')
 
 function sendToSettings(data) {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
@@ -320,7 +339,7 @@ async function loadModel(modelName, force = false) {
   }
 }
 
-async function transcribe(pcm) {
+async function transcribe(pcm, { maxNewTokens = 440 } = {}) {
   if (!whisperPipeline) return ''
 
   const language = /** @type {string} */ (store.get('language', 'german'))
@@ -332,9 +351,11 @@ async function transcribe(pcm) {
     // long-form transcription (overlapping 30s windows are stitched together).
     chunk_length_s: 30,
     stride_length_s: 5,
-    // max_new_tokens as a safety net against repetition loops, a known Whisper
-    // failure mode on silence/noise/unclear speech.
-    max_new_tokens: 440,
+    // max_new_tokens as a safety net (per 30s chunk) against repetition loops, a
+    // known Whisper failure mode on silence/noise/unclear speech. Short dictation
+    // uses the tight default; file transcription raises it, since a dense 30s of
+    // speech (e.g. a fast speaker in a video) can exceed 440 tokens per chunk.
+    max_new_tokens: maxNewTokens,
   }
 
   // Verbose diagnostics (PCM stats + live token streamer) only in dev mode:
@@ -376,6 +397,245 @@ async function transcribe(pcm) {
   // typographic quotes for the current language (see dictation.js).
   return applyDictationMarkers(result.text.trim(), language)
 }
+
+// ── Summarization (local LLM via node-llama-cpp) ───────────────────────────────
+
+// Resolve the GGUF, downloading it once (with progress) if missing. Reuses the
+// same progress channel as the Whisper download so the overlay/settings show a
+// bar. createModelDownloader validates/resumes, so an already-present model
+// completes near-instantly.
+async function ensureLlmModel() {
+  const { createModelDownloader } = await import('node-llama-cpp')
+  const modelUri = /** @type {string} */ (store.get('llmModelUri', DEFAULT_LLM_URI))
+  log(`LLM model: ${modelUri}`)
+  fs.mkdirSync(LLM_CACHE_DIR, { recursive: true })
+  let lastPct = -1
+  const downloader = await createModelDownloader({
+    modelUri,
+    dirPath: LLM_CACHE_DIR,
+    onProgress: ({ totalSize, downloadedSize }) => {
+      if (!totalSize) return
+      const pct = Math.round((downloadedSize / totalSize) * 100)
+      if (pct !== lastPct) {
+        lastPct = pct
+        updateTrayLabel(`LLM ${pct}%`)
+        sendModelProgress({ status: 'progress', progress: pct })
+      }
+    },
+  })
+  const modelPath = await downloader.download()
+  log(`LLM model ready: ${modelPath}`)
+  return modelPath
+}
+
+// Lazily load the LLM on first use and keep it warm. node-llama-cpp is ESM-only,
+// so it's dynamically imported (same pattern as electron-store / transformers).
+async function loadLlm() {
+  if (llmModel) return
+  if (isLoadingLlm) {
+    while (isLoadingLlm) await new Promise((r) => setTimeout(r, 100))
+    if (llmModel) return
+    throw new Error('LLM load failed')
+  }
+  isLoadingLlm = true
+  updateTrayLabel(tr('tray.loadingLlm'))
+  overlayWindow?.showInactive()
+  try {
+    const { getLlama } = await import('node-llama-cpp')
+    const modelPath = await ensureLlmModel()
+    if (!llama) llama = await getLlama()
+    llmModel = await llama.loadModel({ modelPath })
+    log('LLM loaded')
+    updateTrayLabel(null)
+    sendModelProgress({ status: 'ready' })
+    setTimeout(() => overlayWindow?.hide(), 500)
+  } catch (err) {
+    logErr('LLM load error:', errMsg(err))
+    updateTrayLabel(tr('tray.loadError'))
+    sendModelProgress({ status: 'error', message: errMsg(err) })
+    overlayWindow?.hide()
+    throw err
+  } finally {
+    isLoadingLlm = false
+  }
+}
+
+/**
+ * Summarize transcribed text with the local LLM. Returns '' if the model can't
+ * be loaded or produces nothing (caller then falls back to the raw transcript).
+ * A fresh context is created per call and disposed afterwards so the multi-GB
+ * KV cache doesn't accumulate; the model itself stays resident.
+ * @param {string} text
+ * @param {string} language
+ * @returns {Promise<string>}
+ */
+async function summarize(text, language) {
+  if (!text || !text.trim()) return ''
+  await loadLlm()
+  const { LlamaChatSession } = await import('node-llama-cpp')
+  // Single sequence -> serialize requests.
+  while (llmBusy) await new Promise((r) => setTimeout(r, 50))
+  llmBusy = true
+  /** @type {any} */ let context = null
+  try {
+    context = await llmModel.createContext({ contextSize: 4096 })
+    const session = new LlamaChatSession({
+      contextSequence: context.getSequence(),
+      systemPrompt: buildSystemPrompt(language),
+    })
+    const t0 = Date.now()
+    const out = await session.prompt(text.trim(), { maxTokens: 400, temperature: 0.3 })
+    log(`summarize(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+    return cleanSummary(out)
+  } finally {
+    llmBusy = false
+    if (context) { try { await context.dispose() } catch { /* already gone */ } }
+  }
+}
+
+// ── File transcription (ffmpeg -> Whisper) ─────────────────────────────────────
+
+const WHISPER_SAMPLE_RATE = 16000
+// Media containers/codecs offered in the file picker. ffmpeg decodes far more,
+// but this keeps the dialog focused on what users actually dictate/record.
+const MEDIA_EXTENSIONS = ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4a', 'mp3', 'wav', 'aac', 'flac', 'ogg', 'opus']
+
+// ffmpeg-static returns a path inside app.asar when packaged; the binary itself
+// is unpacked (see electron-builder.yml asarUnpack) and must be spawned from
+// there. In dev the path has no app.asar segment, so the replace is a no-op.
+function getFfmpegPath() {
+  const p = /** @type {unknown} */ (require('ffmpeg-static'))
+  return typeof p === 'string' ? p.replace('app.asar', 'app.asar.unpacked') : null
+}
+
+// Decode any supported media file to raw 16 kHz mono float32 PCM (what Whisper
+// expects) by streaming it through ffmpeg. Robust across containers/codecs and
+// memory-friendly for large video files, unlike the renderer's Web Audio path.
+function decodeFileToWhisperPCM(filePath) {
+  return new Promise((resolve, reject) => {
+    const ff = getFfmpegPath()
+    if (!ff) { reject(new Error('ffmpeg binary not found')); return }
+    const { spawn } = require('child_process')
+    const args = [
+      '-i', filePath,
+      '-f', 'f32le', '-ac', '1', '-ar', String(WHISPER_SAMPLE_RATE),
+      '-loglevel', 'error', 'pipe:1',
+    ]
+    const proc = spawn(ff, args)
+    /** @type {Buffer[]} */ const chunks = []
+    let stderr = ''
+    proc.stdout.on('data', (d) => chunks.push(d))
+    proc.stderr.on('data', (d) => { stderr += d.toString() })
+    proc.on('error', reject)
+    proc.on('close', (code) => {
+      if (code !== 0) { reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`)); return }
+      const buf = Buffer.concat(chunks)
+      // Reinterpret the little-endian float32 bytes as a Float32Array view.
+      const pcm = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4))
+      resolve(pcm)
+    })
+  })
+}
+
+function createResultWindow() {
+  resultWindow = new BrowserWindow({
+    width: 620,
+    height: 560,
+    minWidth: 420,
+    minHeight: 360,
+    show: false,
+    title: 'SHOWhisper',
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/result-preload.js'),
+      contextIsolation: true,
+    },
+  })
+  resultWindow.loadFile(path.join(__dirname, '../renderer/result.html'))
+  resultWindow.once('ready-to-show', () => resultWindow?.show())
+  if (isDev) resultWindow.webContents.openDevTools({ mode: 'detach' })
+  resultWindow.on('closed', () => { resultWindow = null; lastFileStatus = null })
+}
+
+function openResultWindow() {
+  if (resultWindow && !resultWindow.isDestroyed()) { resultWindow.focus(); return }
+  createResultWindow()
+}
+
+function sendFileStatus(data) {
+  lastFileStatus = data
+  resultWindow?.webContents.send('file-status', data)
+}
+
+// Orchestrate: open/focus the result window, decode the file, transcribe, and
+// stream status into the window. The summary is offered on demand there (button).
+async function transcribeFileFlow(filePath) {
+  openResultWindow()
+  sendFileStatus({ status: 'transcribing', name: path.basename(filePath) })
+  try {
+    if (!whisperPipeline) {
+      sendFileStatus({ status: 'error', message: tr('result.modelNotReady') })
+      return
+    }
+    const pcm = await decodeFileToWhisperPCM(filePath)
+    log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)}`)
+    // Files can pack dense speech per chunk -> a higher per-chunk token cap.
+    const transcript = await transcribe(pcm, { maxNewTokens: 2048 })
+    log(isDev ? `File transcription: "${transcript}"` : `File transcription done (${transcript.length} chars)`)
+    sendFileStatus({ status: 'done', name: path.basename(filePath), transcript })
+  } catch (err) {
+    logErr('File transcription error:', errMsg(err))
+    sendFileStatus({ status: 'error', message: errMsg(err) })
+  }
+}
+
+// Tray/menu entry: pick a media file, then transcribe it.
+async function openFileForTranscription() {
+  const res = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: tr('result.mediaFilter'), extensions: MEDIA_EXTENSIONS }],
+  })
+  if (res.canceled || !res.filePaths[0]) return
+  transcribeFileFlow(res.filePaths[0])
+}
+
+// Replay the latest status once the result renderer signals it's listening.
+ipcMain.on('result-ready', () => {
+  if (lastFileStatus) resultWindow?.webContents.send('file-status', lastFileStatus)
+})
+
+// A file was dropped onto the result window (path resolved via webUtils in the
+// preload). Only accept plausible media extensions.
+ipcMain.on('result-drop-file', (_e, filePath) => {
+  if (typeof filePath !== 'string') return
+  const ext = path.extname(filePath).slice(1).toLowerCase()
+  if (!MEDIA_EXTENSIONS.includes(ext)) {
+    sendFileStatus({ status: 'error', message: tr('result.unsupported') })
+    return
+  }
+  transcribeFileFlow(filePath)
+})
+
+ipcMain.on('result-open-file', () => openFileForTranscription())
+
+ipcMain.on('result-copy', (_e, text) => {
+  if (typeof text === 'string') clipboard.writeText(text)
+})
+
+ipcMain.handle('result-summarize', async (_e, text) => {
+  const language = /** @type {string} */ (store.get('language', 'german'))
+  return summarize(String(text || ''), language)
+})
+
+ipcMain.handle('result-save', async (_e, text) => {
+  const res = await dialog.showSaveDialog({
+    defaultPath: 'transkript.txt',
+    filters: [{ name: 'Text', extensions: ['txt'] }],
+  })
+  if (res.canceled || !res.filePath) return false
+  fs.writeFileSync(res.filePath, String(text || ''), 'utf8')
+  log('Transcript saved:', res.filePath)
+  return true
+})
 
 // ── Settings Window ──────────────────────────────────────────────────────────
 
@@ -553,21 +813,40 @@ ipcMain.on('cache-open', () => {
 
 ipcMain.on('audio-ready', async (_event, pcm) => {
   log(`Audio received: ${pcm.length} samples`)
+  // Capture and reset the mode immediately - a new recording may start while
+  // this one is still transcribing/summarizing.
+  const summarizeMode = pendingSummarize
+  pendingSummarize = false
   overlayWindow?.webContents.send('transcribing')
 
-  let text = ''
+  const language = /** @type {string} */ (store.get('language', 'german'))
+  let transcript = ''
   try {
-    text = await transcribe(Float32Array.from(pcm))
+    transcript = await transcribe(Float32Array.from(pcm))
     // Only log the recognized text in dev mode (privacy for dictation).
-    log(isDev ? `Transcription: "${text}"` : `Transcription done (${text.length} chars)`)
+    log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
   } catch (err) {
     logErr('Transcription error:', errMsg(err))
   }
 
-  if (text) {
+  // In summarize mode, run the transcript through the local LLM. On any failure
+  // fall back to pasting the raw transcript (dictation must never be lost).
+  let toPaste = transcript
+  let summarized = false
+  if (summarizeMode && transcript) {
+    overlayWindow?.webContents.send('summarizing')
+    try {
+      const summary = await summarize(transcript, language)
+      if (summary) { toPaste = summary; summarized = true }
+    } catch (err) {
+      logErr('Summarization error:', errMsg(err))
+    }
+  }
+
+  if (toPaste) {
     // Save the old clipboard content
     const prev = clipboard.readText()
-    clipboard.writeText(text)
+    clipboard.writeText(toPaste)
 
     // Briefly let the window lose focus, then simulate paste
     overlayWindow?.hide()
@@ -583,8 +862,9 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
       await keyboard.releaseKey(Key.LeftControl, Key.V)
     }
 
-    // Restore the clipboard after a short delay
-    setTimeout(() => clipboard.writeText(prev), 500)
+    // After pasting the summary, leave the full transcript on the clipboard as a
+    // fallback; for a plain dictation, restore the user's previous clipboard.
+    setTimeout(() => clipboard.writeText(summarized ? transcript : prev), 500)
   }
 
   overlayWindow?.webContents.send('done')
@@ -626,6 +906,7 @@ function buildTrayMenu() {
   const menu = Menu.buildFromTemplate([
     { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
+    { label: tr('menu.transcribeFile'), click: openFileForTranscription },
     { label: tr('menu.settings'), click: openSettings },
     {
       label: tr('menu.autostart'),
@@ -669,14 +950,16 @@ function setTrayRecording(recording) {
 
 // ── Hotkey (Toggle) ────────────────────────────────────────────────────────────
 
-const HOTKEY_ACCELERATOR = 'Alt+Space' // Alt == ⌥ Option on macOS
+const HOTKEY_ACCELERATOR = 'Alt+Space'             // ⌥Space: raw dictation
+const HOTKEY_SUMMARIZE = 'Alt+Shift+Space'         // ⌥⇧Space: dictation + summary
 
-// ⌥Space toggles recording. Registered via Electron's globalShortcut, which uses
-// the OS hot-key API (Carbon RegisterEventHotKey on macOS, RegisterHotKey on
-// Windows). Unlike a global keyboard hook (uiohook/CGEventTap), this never sits
-// in the system-wide input delivery path, so it can't freeze keyboard/mouse
-// input for the whole machine.
-function toggleRecording() {
+// Toggles recording. Registered via Electron's globalShortcut, which uses the OS
+// hot-key API (Carbon RegisterEventHotKey on macOS, RegisterHotKey on Windows).
+// Unlike a global keyboard hook (uiohook/CGEventTap), this never sits in the
+// system-wide input delivery path, so it can't freeze keyboard/mouse input for
+// the whole machine. `summarizeMode` (from ⌥⇧Space) is captured at start and
+// makes 'audio-ready' summarize the transcript before pasting.
+function toggleRecording(summarizeMode = false) {
   // globalShortcut can fire repeatedly while the combo is held (OS key auto-
   // repeat). Debounce so a brief hold doesn't rapidly flip start/stop.
   const now = Date.now()
@@ -691,6 +974,7 @@ function toggleRecording() {
       log('Recording ignored: model still loading')
       return
     }
+    pendingSummarize = summarizeMode
     isRecording = true
     setTrayRecording(true)
     overlayWindow?.showInactive()
@@ -703,7 +987,7 @@ function toggleRecording() {
 }
 
 function setupHotkey() {
-  const ok = globalShortcut.register(HOTKEY_ACCELERATOR, toggleRecording)
+  const ok = globalShortcut.register(HOTKEY_ACCELERATOR, () => toggleRecording(false))
   if (!ok || !globalShortcut.isRegistered(HOTKEY_ACCELERATOR)) {
     // Registration fails when another app already owns the combo. The hotkey is
     // the only way to trigger recording, so surface it rather than fail silently
@@ -718,6 +1002,15 @@ function setupHotkey() {
     return
   }
   log(`Global shortcut registered: ${HOTKEY_ACCELERATOR}`)
+
+  // Summarize hotkey is optional - if the combo is taken, just log it; plain
+  // dictation still works.
+  const okSum = globalShortcut.register(HOTKEY_SUMMARIZE, () => toggleRecording(true))
+  if (okSum && globalShortcut.isRegistered(HOTKEY_SUMMARIZE)) {
+    log(`Global shortcut registered: ${HOTKEY_SUMMARIZE}`)
+  } else {
+    logErr(`Global shortcut ${HOTKEY_SUMMARIZE} could not be registered (already in use)`)
+  }
 }
 
 // nut-js simulates ⌘V/Ctrl+V to paste the transcript (see 'audio-ready'). On

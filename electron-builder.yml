@@ -36,7 +36,16 @@ asar: true
 # Native modules must be unpacked from the asar archive, otherwise the loader
 # can't find the *.node/*.dylib binaries in the packaged build (the app starts
 # locally via `npm start`, but the .dmg version fails to load the modules).
+# - node-llama-cpp resolves the llama.cpp shared libs and metadata from its
+#   bins/llama dirs and the per-platform @node-llama-cpp/* prebuild packages,
+#   not just the *.node addon - all must be unpacked.
+# - ffmpeg-static ships a plain ffmpeg binary that we spawn; require('ffmpeg-static')
+#   returns a path inside app.asar, so it must live in .unpacked (see main.js).
 asarUnpack:
   - "**/node_modules/@nut-tree-fork/**"
   - "**/node_modules/onnxruntime-node/**"
   - "**/*.node"
+  - "**/node_modules/node-llama-cpp/bins/**"
+  - "**/node_modules/node-llama-cpp/llama/**"
+  - "**/node_modules/@node-llama-cpp/**"
+  - "**/node_modules/ffmpeg-static/**"
