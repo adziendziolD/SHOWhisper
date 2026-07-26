@@ -69,6 +69,8 @@ let settingsWindow = null
 let resultWindow = null        // file-transcription result window
 /** @type {any} */
 let lastFileStatus = null      // replayed to the result window once it's listening
+/** @type {string | null} */
+let lastFilePath = null        // remembered so a model change can re-transcribe it
 /** @type {any} */
 let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
 let isLoadingModel = false
@@ -169,6 +171,107 @@ ipcMain.on('overlay-ready', () => {
   if (lastModelProgress) overlayWindow?.webContents.send('model-loading', lastModelProgress)
 })
 
+// Build the aggregating transformers.js progress_callback for a model load.
+// Multiple .onnx parts load in parallel; this reports one steady, monotonic
+// overall percentage to the tray + UI (see the inline reasoning below).
+function makeProgressCallback(modelName) {
+  const lastLoggedPct = {}
+  const fileBytes = {}
+  let lastSentPct = -1
+  return (data) => {
+    if (data.status === 'progress') {
+      const pct  = Math.round(data.progress)
+      const file = (data.file || '').split('/').pop()
+      const step = Math.floor(pct / 10) * 10
+      if (lastLoggedPct[file] !== step) {
+        lastLoggedPct[file] = step
+        log(`Download [${file}] ${step}%`)
+      }
+
+      // Tokenizer/config files (including tokenizer.json, which depending on
+      // the model can be several MB) load completely before the actual model
+      // weights (which can take minutes) even start. A size threshold isn't
+      // enough, since tokenizer.json is sometimes larger than the weights of
+      // a "tiny" model. So only count files that contain ".onnx" in the name
+      // - that covers both "encoder_model.onnx" and, for larger models, the
+      // externalized "encoder_model.onnx_data" (ONNX external data, needed
+      // above the ~2GB protobuf limit; "endsWith('.onnx')" wouldn't match the
+      // _data variant).
+      //
+      // But even within the .onnx files the same problem recurs: the small
+      // "*.onnx" graph file (a few KB-MB) often loads completely in a single
+      // event, BEFORE the huge associated "*.onnx_data" weights file even
+      // starts - and would falsely freeze the monotonic lock below at 100%.
+      // So additionally: only count files we've already seen at <100% or are
+      // already tracking (excludes instantly-complete files on first
+      // appearance, without missing later updates of an already-running file).
+      if (file.includes('.onnx') && (pct < 100 || fileBytes[file] !== undefined)) {
+        fileBytes[file] = { loaded: data.loaded || 0, total: data.total || 0 }
+      }
+      const totals = Object.values(fileBytes).reduce(
+        (acc, f) => ({ loaded: acc.loaded + f.loaded, total: acc.total + f.total }),
+        { loaded: 0, total: 0 }
+      )
+      // totals.total === 0 means: no .onnx file seen yet, only metadata -
+      // so don't show any progress yet.
+      if (totals.total === 0) return
+      const rawPct = Math.round((totals.loaded / totals.total) * 100)
+      // As soon as another (large) file starts loading, its total size
+      // immediately enters the denominator while its loaded portion is still
+      // 0 -> the overall value can briefly jump back. Never display
+      // backwards, that would look like an error.
+      const overallPct = Math.max(rawPct, lastSentPct)
+      updateTrayLabel(`${modelName} ${overallPct}%`)
+
+      // Only send on an actual percentage change, otherwise the UI flickers
+      if (overallPct !== lastSentPct) {
+        lastSentPct = overallPct
+        sendModelProgress({ status: 'progress', progress: overallPct })
+      }
+    } else if (data.status === 'done') {
+      log(`Model status: done`, data.file || '')
+    }
+  }
+}
+
+// Create (downloading if needed) a Whisper ASR pipeline for the given model,
+// with the CoreML->CPU device fallback. Throws on failure. Used both for the
+// active dictation model (loadModel) and for temporary per-file models.
+async function buildWhisperPipeline(modelName, progress_callback) {
+  const { pipeline, env } = await import('@huggingface/transformers')
+  env.cacheDir = MODEL_CACHE_DIR
+  const modelId = `${PROVIDER}/whisper-${modelName}`
+  log(`Loading model: ${modelId}`)
+
+  // Device/dtype history (see PLAN.md background):
+  // - CoreML + fp32 + default memory allocator: hangs/crashes during
+  //   inference with real speech and larger models (medium/large).
+  // - CPU + fp32 + default allocator: same picture - onnxruntime's
+  //   BFCArena memory-pool allocator crashes (posix_memalign) on extend,
+  //   reproducible with real audio data, but ONLY in the real Electron
+  //   process (much higher memory footprint due to the GPU
+  //   process/compositor) - never in an isolated Node script.
+  // - fp16 (CoreML and CPU alike): already fails at load time with an
+  //   ONNX graph error (LayerNorm fusion/InsertedPrecisionFreeCast) - the
+  //   fp16 file itself is incompatible with this onnxruntime version,
+  //   regardless of device.
+  // - `session_options: { enableCpuMemArena: false }` disables the buggy
+  //   pool allocator (plain malloc/free instead of pooling) - fixes the
+  //   crash completely. With that, CoreML + fp32 (best quality + Apple
+  //   Silicon GPU/Neural Engine) runs reliably. CoreML + q8 still crashes
+  //   (quantization + CoreML don't get along), so fp32 for the CoreML path.
+  const preferredDevice = process.platform === 'darwin' ? 'coreml' : 'cpu'
+  try {
+    return await pipeline('automatic-speech-recognition', modelId,
+      { device: preferredDevice, dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback })
+  } catch (deviceErr) {
+    if (preferredDevice === 'cpu') throw deviceErr
+    logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, errMsg(deviceErr))
+    return await pipeline('automatic-speech-recognition', modelId,
+      { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback })
+  }
+}
+
 async function loadModel(modelName, force = false) {
   if (isLoadingModel && !force) {
     log('loadModel: already loading, skipped')
@@ -184,112 +287,8 @@ async function loadModel(modelName, force = false) {
   overlayWindow?.showInactive()
 
   try {
-    const { pipeline, env } = await import('@huggingface/transformers')
-
-    env.cacheDir = MODEL_CACHE_DIR
-    const modelId  = `${PROVIDER}/whisper-${modelName}`
-    log(`Loading model: ${modelId}`)
-    log(`Cache dir:    ${MODEL_CACHE_DIR}`)
-
-    // Throttle logging: per file only at whole 10% steps
-    const lastLoggedPct = {}
-    // Multiple .onnx parts (encoder/decoder) load in parallel - passing each
-    // file's percentage to the UI individually would make the bar jump back
-    // and forth between different per-file values. Instead aggregate over the
-    // bytes of all files -> a single, steady overall value.
-    const fileBytes = {}
-    let lastSentPct = -1
-    const progress_callback = (data) => {
-      if (data.status === 'progress') {
-        const pct  = Math.round(data.progress)
-        const file = (data.file || '').split('/').pop()
-        const step = Math.floor(pct / 10) * 10
-        if (lastLoggedPct[file] !== step) {
-          lastLoggedPct[file] = step
-          log(`Download [${file}] ${step}%`)
-        }
-
-        // Tokenizer/config files (including tokenizer.json, which depending on
-        // the model can be several MB) load completely before the actual model
-        // weights (which can take minutes) even start. A size threshold isn't
-        // enough, since tokenizer.json is sometimes larger than the weights of
-        // a "tiny" model. So only count files that contain ".onnx" in the name
-        // - that covers both "encoder_model.onnx" and, for larger models, the
-        // externalized "encoder_model.onnx_data" (ONNX external data, needed
-        // above the ~2GB protobuf limit; "endsWith('.onnx')" wouldn't match the
-        // _data variant).
-        //
-        // But even within the .onnx files the same problem recurs: the small
-        // "*.onnx" graph file (a few KB-MB) often loads completely in a single
-        // event, BEFORE the huge associated "*.onnx_data" weights file even
-        // starts - and would falsely freeze the monotonic lock below at 100%.
-        // So additionally: only count files we've already seen at <100% or are
-        // already tracking (excludes instantly-complete files on first
-        // appearance, without missing later updates of an already-running file).
-        if (file.includes('.onnx') && (pct < 100 || fileBytes[file] !== undefined)) {
-          fileBytes[file] = { loaded: data.loaded || 0, total: data.total || 0 }
-        }
-        const totals = Object.values(fileBytes).reduce(
-          (acc, f) => ({ loaded: acc.loaded + f.loaded, total: acc.total + f.total }),
-          { loaded: 0, total: 0 }
-        )
-        // totals.total === 0 means: no .onnx file seen yet, only metadata -
-        // so don't show any progress yet.
-        if (totals.total === 0) return
-        const rawPct = Math.round((totals.loaded / totals.total) * 100)
-        // As soon as another (large) file starts loading, its total size
-        // immediately enters the denominator while its loaded portion is still
-        // 0 -> the overall value can briefly jump back. Never display
-        // backwards, that would look like an error.
-        const overallPct = Math.max(rawPct, lastSentPct)
-        updateTrayLabel(`${modelName} ${overallPct}%`)
-
-        // Only send on an actual percentage change, otherwise the UI flickers
-        if (overallPct !== lastSentPct) {
-          lastSentPct = overallPct
-          sendModelProgress({ status: 'progress', progress: overallPct })
-        }
-      } else if (data.status === 'done') {
-        log(`Model status: done`, data.file || '')
-      }
-    }
-
-    // Device/dtype history (see PLAN.md background):
-    // - CoreML + fp32 + default memory allocator: hangs/crashes during
-    //   inference with real speech and larger models (medium/large).
-    // - CPU + fp32 + default allocator: same picture - onnxruntime's
-    //   BFCArena memory-pool allocator crashes (posix_memalign) on extend,
-    //   reproducible with real audio data, but ONLY in the real Electron
-    //   process (much higher memory footprint due to the GPU
-    //   process/compositor) - never in an isolated Node script.
-    // - fp16 (CoreML and CPU alike): already fails at load time with an
-    //   ONNX graph error (LayerNorm fusion/InsertedPrecisionFreeCast) - the
-    //   fp16 file itself is incompatible with this onnxruntime version,
-    //   regardless of device.
-    // - `session_options: { enableCpuMemArena: false }` disables the buggy
-    //   pool allocator (plain malloc/free instead of pooling) - fixes the
-    //   crash completely. With that, CoreML + fp32 (best quality + Apple
-    //   Silicon GPU/Neural Engine) runs reliably - verified 3 times in a row
-    //   with the same real audio data. CoreML + q8 still crashes
-    //   (quantization + CoreML don't get along), so fp32 instead of q8 for
-    //   the CoreML path.
-    const preferredDevice = process.platform === 'darwin' ? 'coreml' : 'cpu'
-    let pipe
-    try {
-      pipe = await pipeline(
-        'automatic-speech-recognition',
-        modelId,
-        { device: preferredDevice, dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback }
-      )
-    } catch (deviceErr) {
-      if (preferredDevice === 'cpu') throw deviceErr
-      logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, errMsg(deviceErr))
-      pipe = await pipeline(
-        'automatic-speech-recognition',
-        modelId,
-        { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback }
-      )
-    }
+    const modelId = `${PROVIDER}/whisper-${modelName}`
+    const pipe = await buildWhisperPipeline(modelName, makeProgressCallback(modelName))
     // Superseded by a newer load in the meantime? Then discard the result, so
     // we don't overwrite the model that was just freshly loaded.
     if (myGen !== loadGeneration) {
@@ -339,8 +338,8 @@ async function loadModel(modelName, force = false) {
   }
 }
 
-async function transcribe(pcm, { maxNewTokens = 440 } = {}) {
-  if (!whisperPipeline) return ''
+async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline } = {}) {
+  if (!pipeline) return ''
 
   const language = /** @type {string} */ (store.get('language', 'german'))
   const genOptions = {
@@ -376,7 +375,7 @@ async function transcribe(pcm, { maxNewTokens = 440 } = {}) {
     const tStart = Date.now()
     let lastTokenAt = tStart
     let tokenCount = 0
-    genOptions.streamer = new WhisperTextStreamer(whisperPipeline.tokenizer, {
+    genOptions.streamer = new WhisperTextStreamer(pipeline.tokenizer, {
       on_chunk_start: (x) => log(`  [streamer] Chunk start at ${x.toFixed(2)}s`),
       token_callback_function: (tokens) => {
         const now = Date.now()
@@ -391,7 +390,7 @@ async function transcribe(pcm, { maxNewTokens = 440 } = {}) {
   }
 
   const t0 = Date.now()
-  const result = await whisperPipeline(pcm, genOptions)
+  const result = await pipeline(pcm, genOptions)
   log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
   // typographic quotes for the current language (see dictation.js).
@@ -566,22 +565,55 @@ function sendFileStatus(data) {
   resultWindow?.webContents.send('file-status', data)
 }
 
-// Orchestrate: open/focus the result window, decode the file, transcribe, and
-// stream status into the window. The summary is offered on demand there (button).
+// The Whisper model to use for file transcription. Independent from the live
+// dictation model (store 'model') so a big, slow model can be used for files
+// without slowing dictation. Defaults to the dictation model until changed.
+function getFileModel() {
+  const m = /** @type {string} */ (store.get('fileModel', store.get('model', 'small')))
+  return MODELS.includes(m) ? m : 'small'
+}
+
+// Transcribe file PCM with the chosen model. If it's the active dictation model,
+// reuse the warm pipeline; otherwise build a temporary pipeline just for this
+// file and dispose it afterwards, leaving the dictation model loaded and active.
+async function transcribeFilePCM(pcm, modelName) {
+  const activeModel = store.get('model', 'small')
+  if (modelName === activeModel && whisperPipeline) {
+    return transcribe(pcm, { maxNewTokens: 2048 })
+  }
+  overlayWindow?.showInactive()
+  updateTrayLabel(tr('tray.loading', { model: modelName }))
+  /** @type {any} */ let tempPipe = null
+  try {
+    tempPipe = await buildWhisperPipeline(modelName, makeProgressCallback(modelName))
+    sendModelProgress({ status: 'ready' })
+    updateTrayLabel(null)
+    setTimeout(() => overlayWindow?.hide(), 300)
+    return await transcribe(pcm, { maxNewTokens: 2048, pipeline: tempPipe })
+  } finally {
+    updateTrayLabel(null)
+    // Free the temporary model's native memory; best-effort (older transformers
+    // builds may not expose dispose()).
+    if (tempPipe && typeof tempPipe.dispose === 'function') {
+      try { await tempPipe.dispose() } catch { /* already gone */ }
+    }
+  }
+}
+
+// Orchestrate: open/focus the result window, decode the file, transcribe with
+// the selected file model, and stream status into the window. The summary is
+// offered on demand there (button).
 async function transcribeFileFlow(filePath) {
   openResultWindow()
-  sendFileStatus({ status: 'transcribing', name: path.basename(filePath) })
+  lastFilePath = filePath
+  const model = getFileModel()
+  sendFileStatus({ status: 'transcribing', name: path.basename(filePath), model })
   try {
-    if (!whisperPipeline) {
-      sendFileStatus({ status: 'error', message: tr('result.modelNotReady') })
-      return
-    }
     const pcm = await decodeFileToWhisperPCM(filePath)
-    log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)}`)
-    // Files can pack dense speech per chunk -> a higher per-chunk token cap.
-    const transcript = await transcribe(pcm, { maxNewTokens: 2048 })
+    log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)} (model: ${model})`)
+    const transcript = await transcribeFilePCM(pcm, model)
     log(isDev ? `File transcription: "${transcript}"` : `File transcription done (${transcript.length} chars)`)
-    sendFileStatus({ status: 'done', name: path.basename(filePath), transcript })
+    sendFileStatus({ status: 'done', name: path.basename(filePath), transcript, model })
   } catch (err) {
     logErr('File transcription error:', errMsg(err))
     sendFileStatus({ status: 'error', message: errMsg(err) })
@@ -616,6 +648,22 @@ ipcMain.on('result-drop-file', (_e, filePath) => {
 })
 
 ipcMain.on('result-open-file', () => openFileForTranscription())
+
+// Model selector in the result window: expose the choices + current selection.
+ipcMain.handle('result-config', () => ({
+  models: MODELS,
+  labels: MODEL_LABELS,
+  fileModel: getFileModel(),
+}))
+
+// Change the file-transcription model and, if a file is already loaded,
+// re-transcribe it with the new model.
+ipcMain.on('result-set-file-model', (_e, model) => {
+  if (!MODELS.includes(model)) return
+  store.set('fileModel', model)
+  log('File model set:', model)
+  if (lastFilePath) transcribeFileFlow(lastFilePath)
+})
 
 ipcMain.on('result-copy', (_e, text) => {
   if (typeof text === 'string') clipboard.writeText(text)

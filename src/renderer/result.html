@@ -47,6 +47,21 @@
     #dropzone.drag { border-color: #5b5bd6; background: #17171d; color: #cfcfe6; }
     #dropzone .hint { font-size: 11px; color: #555; margin-top: 4px; }
 
+    #model-field { margin-bottom: 16px; }
+    #model-field .hint { font-size: 11px; color: #555; margin-top: 5px; }
+    select {
+      width: 100%;
+      padding: 8px 10px;
+      background: #1e1e22;
+      border: 1px solid #2e2e34;
+      border-radius: 8px;
+      color: #e8e8ea;
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus { border-color: #5b5bd6; }
+    select:disabled { opacity: 0.5; }
+
     textarea {
       width: 100%;
       min-height: 120px;
@@ -119,6 +134,12 @@
     <div class="hint" data-i18n="result.dropHint">mp4, mov, mp3, m4a, wav …</div>
   </div>
 
+  <div id="model-field">
+    <label for="file-model" data-i18n="result.model">Transkriptions-Modell für Dateien</label>
+    <select id="file-model"></select>
+    <p class="hint" data-i18n="result.modelHint">Für Dateien lohnt sich ein größeres Modell (genauer). Das Diktat-Modell bleibt davon unberührt.</p>
+  </div>
+
   <div id="status"></div>
 
   <div id="transcript-section" class="section hidden">
@@ -181,20 +202,39 @@
     // ── File status from main ─────────────────────────────────────────────────
     window.result.onFileStatus((data) => {
       if (data.status === 'transcribing') {
+        $('file-model').disabled = true
         $('transcript-section').classList.add('hidden')
         $('summary-section').classList.add('hidden')
         setBusyStatus(T('result.transcribing', { name: data.name || '' }))
       } else if (data.status === 'done') {
+        $('file-model').disabled = false
         setStatus('')
         $('transcript').value = data.transcript || ''
         $('transcript-section').classList.remove('hidden')
         $('summary-section').classList.add('hidden')
         $('btn-summarize').disabled = !data.transcript
       } else if (data.status === 'error') {
+        $('file-model').disabled = false
         $('transcript-section').classList.add('hidden')
         setStatus(T('result.error', { error: data.message || '' }), true)
       }
     })
+
+    // ── File-transcription model selector ─────────────────────────────────────
+    async function initModelSelect() {
+      const cfg = await window.result.config()
+      const sel = $('file-model')
+      sel.innerHTML = ''
+      for (const m of cfg.models) {
+        const opt = document.createElement('option')
+        opt.value = m
+        opt.textContent = cfg.labels[m] || m
+        if (m === cfg.fileModel) opt.selected = true
+        sel.appendChild(opt)
+      }
+      // Changing the model re-transcribes the current file (main handles that).
+      sel.addEventListener('change', () => window.result.setFileModel(sel.value))
+    }
 
     // ── Summarize ─────────────────────────────────────────────────────────────
     $('btn-summarize').addEventListener('click', async () => {
@@ -240,8 +280,9 @@
 
     // ── Init ──────────────────────────────────────────────────────────────────
     window.result.onLanguageChanged(applyI18n)
-    window.result.getLanguage().then((lang) => {
+    window.result.getLanguage().then(async (lang) => {
       applyI18n(lang || 'german')
+      await initModelSelect()
       window.result.ready()
     })
   </script>

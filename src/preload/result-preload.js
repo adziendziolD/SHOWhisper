@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('i18n', { t })
 contextBridge.exposeInMainWorld('result', {
   ready:             ()     => ipcRenderer.send('result-ready'),
   onFileStatus:      (cb)   => ipcRenderer.on('file-status', (_e, data) => cb(data)),
+  config:            ()     => ipcRenderer.invoke('result-config'),
+  setFileModel:      (m)    => ipcRenderer.send('result-set-file-model', m),
   summarize:         (text) => ipcRenderer.invoke('result-summarize', text),
   save:              (text) => ipcRenderer.invoke('result-save', text),
   copy:              (text) => ipcRenderer.send('result-copy', text),

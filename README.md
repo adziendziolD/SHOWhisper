@@ -43,7 +43,9 @@ The summary runs fully offline. The first time you use it, a GGUF model is downl
 
 ## Transcribing a file
 
-Choose **Transcribe file…** from the tray menu, or drag a media file onto the result window. The file is decoded with a bundled ffmpeg (so any common container/codec works — mp4, mov, mkv, webm, mp3, m4a, wav, …) and transcribed with the same Whisper model. The result window shows the transcript with **Copy**, **Save…**, and a **Summarize** button (same local LLM as above).
+Choose **Transcribe file…** from the tray menu, or drag a media file onto the result window. The file is decoded with a bundled ffmpeg (so any common container/codec works — mp4, mov, mkv, webm, mp3, m4a, wav, …) and transcribed with Whisper. The result window shows the transcript with **Copy**, **Save…**, and a **Summarize** button (same local LLM as above).
+
+Files can use a **different (larger) Whisper model** than live dictation — pick it in the result window's model selector. Latency doesn't matter for files, so `medium`/`large` gives better accuracy. It's loaded only for the file and disposed afterwards, so your fast dictation model stays loaded and active. The choice is remembered separately (store key `fileModel`); changing it re-transcribes the current file.
 
 ## Hotkeys
 
