@@ -99,6 +99,22 @@ function stopTimer() {
 
 // ── Recording ─────────────────────────────────────────────────────────────────
 
+// Tear everything down and report the failure to the main process, which
+// resets tray/toggle state and informs the user. Used by every error path so
+// the pill can never stay stuck in a recording/transcribing state.
+function failRecording(message) {
+  stopTimer()
+  if (animFrameId !== null) cancelAnimationFrame(animFrameId)
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  if (mediaRecorder) {
+    try { mediaRecorder.stream.getTracks().forEach((t) => t.stop()) } catch { /* already stopped */ }
+    mediaRecorder = null
+  }
+  if (audioCtx) { audioCtx.close(); audioCtx = null }
+  setState('')
+  window.whisper.recordingFailed(message)
+}
+
 async function startRecording() {
   audioChunks = []
 
@@ -124,6 +140,12 @@ async function startRecording() {
 
   mediaRecorder = new MediaRecorder(stream)
   mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data)
+  // A recorder error mid-recording (device unplugged, OS revoked access) would
+  // otherwise leave the pill stuck and the main-process toggle desynced.
+  mediaRecorder.onerror = (e) => {
+    console.error('[overlay] MediaRecorder error:', e)
+    failRecording((e && /** @type {any} */ (e).error && /** @type {any} */ (e).error.message) || 'MediaRecorder error')
+  }
   mediaRecorder.start()
 
   setState('recording')
@@ -163,25 +185,35 @@ async function stopRecording() {
   if (animFrameId !== null) cancelAnimationFrame(animFrameId)
   ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-  const recorder = mediaRecorder
-  await new Promise((resolve) => {
-    recorder.onstop = resolve
-    recorder.stop()
-    recorder.stream.getTracks().forEach((t) => t.stop())
-  })
+  // Any failure below (recorder error, empty/corrupt blob, decode error) must
+  // end in recordingFailed - otherwise no 'audio-ready' ever reaches main and
+  // the pill/tray stay stuck in a recording state.
+  try {
+    const recorder = mediaRecorder
+    await new Promise((resolve) => {
+      recorder.onstop = resolve
+      recorder.onerror = resolve // an errored recorder may never fire onstop
+      recorder.stop()
+      recorder.stream.getTracks().forEach((t) => t.stop())
+    })
 
-  // Close the AudioContext - browsers cap the number of open contexts (~6),
-  // otherwise new AudioContext() fails after a few recordings.
-  if (audioCtx) { audioCtx.close(); audioCtx = null }
-  mediaRecorder = null
+    // Close the AudioContext - browsers cap the number of open contexts (~6),
+    // otherwise new AudioContext() fails after a few recordings.
+    if (audioCtx) { audioCtx.close(); audioCtx = null }
+    mediaRecorder = null
 
-  const blob = new Blob(audioChunks, { type: 'audio/webm' })
-  console.log('[overlay] stopRecording: Blob', blob.size, 'bytes,', audioChunks.length, 'chunks')
-  const t0 = performance.now()
-  const pcm  = await decodeToWhisperPCM(blob)
-  console.log('[overlay] decodeToWhisperPCM done after', (performance.now() - t0).toFixed(0), 'ms,', pcm.length, 'samples')
-  window.whisper.sendAudio(pcm)
-  console.log('[overlay] sendAudio() called')
+    const blob = new Blob(audioChunks, { type: 'audio/webm' })
+    console.log('[overlay] stopRecording: Blob', blob.size, 'bytes,', audioChunks.length, 'chunks')
+    if (blob.size === 0) throw new Error('No audio data recorded')
+    const t0 = performance.now()
+    const pcm  = await decodeToWhisperPCM(blob)
+    console.log('[overlay] decodeToWhisperPCM done after', (performance.now() - t0).toFixed(0), 'ms,', pcm.length, 'samples')
+    window.whisper.sendAudio(pcm)
+    console.log('[overlay] sendAudio() called')
+  } catch (err) {
+    console.error('[overlay] stopRecording failed:', err)
+    failRecording(err instanceof Error ? err.message : String(err))
+  }
 }
 
 // ── IPC Events ────────────────────────────────────────────────────────────────

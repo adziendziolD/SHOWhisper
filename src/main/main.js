@@ -1,9 +1,7 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, globalShortcut } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, globalShortcut, utilityProcess } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
-const { applyDictationMarkers } = require('../shared/dictation')
-const { buildSystemPrompt, cleanSummary } = require('../shared/summarize')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -56,14 +54,6 @@ function logErr(...args) { elog.error(...args.map(safeArg)) }
  */
 function errMsg(e) { return e instanceof Error ? e.message : String(e) }
 
-// Marker error for a user-cancelled transcription (distinguished from real
-// failures so the UI can reset quietly instead of showing an error).
-function cancelledError() {
-  const e = /** @type {any} */ (new Error('cancelled'))
-  e.cancelled = true
-  return e
-}
-
 // electron-store is ESM-only since v9, main.js is CommonJS -> import it
 // dynamically once the app is ready (see app.whenReady()). Typed non-null:
 // every access happens after whenReady has assigned it.
@@ -88,13 +78,15 @@ let resultWindow = null        // file-transcription result window
 let lastFileStatus = null      // replayed to the result window once it's listening
 /** @type {string | null} */
 let lastFilePath = null        // remembered so a model change can re-transcribe it
-/** @type {any} */
-let activeStopper = null       // InterruptableStoppingCriteria of the running file transcription
-/** @type {any} */
-let whisperPipeline = null     // @huggingface/transformers pipeline (callable + .tokenizer)
-let isLoadingModel = false
-let loadGeneration = 0         // prevents a superseded load from overwriting state
+let fileJobRunning = false     // one file transcription at a time
+let overlayReady = false       // the overlay renderer is loaded and listening
+/** @type {string | null} */
+let loadedModel = null         // mirror of the worker's loaded dictation model
+let loadingCount = 0           // >0 while a dictation-model load is in flight
+/** @type {Promise<boolean>} */
+let modelReadyPromise = Promise.resolve(false) // resolves true once the model is usable
 let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
+let dictationCount = 0         // >0 while an 'audio-ready' flow (transcribe/summarize/paste) runs
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
 let pendingSummarize = false   // set when recording was started via the summarize hotkey
 // Supported transcription languages (Whisper language names)
@@ -105,16 +97,114 @@ const PROVIDER = 'Xenova'
 const MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 const MODEL_LABELS = { tiny: 'tiny (75 MB)', base: 'base (150 MB)', small: 'small (450 MB)', medium: 'medium (1.5 GB)', large: 'large (3 GB)' }
 
-// ── Local LLM (summarization, node-llama-cpp) ──────────────────────────────────
-// Optional, lazily loaded on first summarize. Stays fully offline/local. The
-// GGUF is downloaded once into userData/llm-cache (never bundled). Default is a
-// current (2025) multilingual instruct model; override via the store key
-// 'llmModelUri' (any node-llama-cpp `hf:owner/repo:quant` URI or local path).
+// Default summarization model (see whisper-worker.js); override via the store
+// key 'llmModelUri' (any node-llama-cpp `hf:owner/repo:quant` URI or local path).
 const DEFAULT_LLM_URI = 'hf:unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M'
-/** @type {any} */ let llama = null       // getLlama() runtime handle
-/** @type {any} */ let llmModel = null    // loaded GGUF model, kept warm between summaries
-let isLoadingLlm = false
-let llmBusy = false            // single context sequence -> one summarize at a time
+
+// Cache in the home directory, not in node_modules
+const MODEL_CACHE_DIR = path.join(app.getPath('userData'), 'model-cache')
+// Separate cache for the (optional, large) summarization GGUF.
+const LLM_CACHE_DIR = path.join(app.getPath('userData'), 'llm-cache')
+
+// ── Inference worker (utilityProcess) ───────────────────────────────────────────
+// All heavy lifting (Whisper, ffmpeg decode, LLM) runs in whisper-worker.js so
+// the main process event loop - which drives the tray, all windows and IPC -
+// never blocks, and a native crash (onnxruntime/llama.cpp) doesn't take the
+// whole app down: we detect the exit, reset state and respawn.
+
+/** @type {import('electron').UtilityProcess | null} */
+let worker = null
+let workerReqId = 0
+/** @type {Map<number, { resolve: (v: any) => void, reject: (e: any) => void, onProgress?: (p: any) => void }>} */
+const pendingRequests = new Map()
+let quitting = false
+/** @type {number[]} */
+let workerRestarts = []        // timestamps, to detect a crash loop
+
+function spawnWorker() {
+  worker = utilityProcess.fork(path.join(__dirname, 'whisper-worker.js'), [], {
+    serviceName: 'SHOWhisper Inference',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  // The worker logs via console; pipe its output into the main log file.
+  worker.stdout?.on('data', (d) => { const s = d.toString().trimEnd(); if (s) elog.info('[worker]', s) })
+  worker.stderr?.on('data', (d) => { const s = d.toString().trimEnd(); if (s) elog.error('[worker]', s) })
+  // postMessage is queued until the child has spawned, and ordering is
+  // preserved - so init is always the first message the worker sees.
+  worker.postMessage({ type: 'init', cacheDir: MODEL_CACHE_DIR, llmCacheDir: LLM_CACHE_DIR, isDev })
+  worker.on('message', handleWorkerMessage)
+  worker.on('exit', handleWorkerExit)
+}
+
+function handleWorkerMessage(msg) {
+  if (msg.type === 'result') {
+    const req = pendingRequests.get(msg.id)
+    if (!req) return
+    pendingRequests.delete(msg.id)
+    if (msg.ok) {
+      req.resolve(msg.value)
+    } else {
+      const e = /** @type {any} */ (new Error(msg.error || 'Worker error'))
+      e.cancelled = !!msg.cancelled
+      req.reject(e)
+    }
+  } else if (msg.type === 'progress') {
+    pendingRequests.get(msg.id)?.onProgress?.(msg)
+  } else if (msg.type === 'model-progress') {
+    // Download/load progress of any model (dictation, temp file model, LLM).
+    if (msg.data?.status === 'progress') updateTrayLabel(`${msg.model} ${msg.data.progress}%`)
+    else if (msg.data?.status === 'ready') updateTrayLabel(null)
+    sendModelProgress(msg.data)
+  }
+}
+
+function handleWorkerExit(code) {
+  const requests = [...pendingRequests.values()]
+  pendingRequests.clear()
+  worker = null
+  loadedModel = null
+  // Note: fileJobRunning is NOT reset here - the rejections below propagate to
+  // transcribeFileFlow, whose finally block resets it in the right order.
+  for (const req of requests) {
+    const e = /** @type {any} */ (new Error(`Whisper worker exited unexpectedly (code ${code})`))
+    e.workerExit = true
+    req.reject(e)
+  }
+  if (quitting) return
+  logErr(`Whisper worker exited (code ${code}) - restarting`)
+  sendModelProgress({ status: 'error', message: `Worker exited (code ${code})` })
+
+  // Crash-loop brake: if the worker keeps dying right away, stop auto-reloading
+  // (the next explicit action respawns it via workerRequest).
+  workerRestarts = workerRestarts.filter((ts) => Date.now() - ts < 5 * 60_000)
+  workerRestarts.push(Date.now())
+  if (workerRestarts.length > 3) {
+    logErr('Worker crash loop detected - not restarting automatically')
+    updateTrayLabel(tr('tray.loadError'))
+    return
+  }
+  spawnWorker()
+  // Reload the dictation model so the next hotkey press works again.
+  loadModel(/** @type {string} */ (store.get('model', 'small')))
+}
+
+/**
+ * Send one request to the worker and await its result. Progress messages for
+ * this request are delivered to onProgress.
+ * @param {string} type
+ * @param {Record<string, unknown>} [payload]
+ * @param {{ onProgress?: (p: any) => void }} [opts]
+ * @returns {Promise<any>}
+ */
+function workerRequest(type, payload = {}, { onProgress } = {}) {
+  if (!worker) spawnWorker()
+  const id = ++workerReqId
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, { resolve, reject, onProgress })
+    const w = /** @type {import('electron').UtilityProcess} */ (worker)
+    w.postMessage({ type, id, ...payload })
+  })
+}
 
 // ── Overlay Window ────────────────────────────────────────────────────────────
 
@@ -125,6 +215,7 @@ function createOverlay() {
     y: height - 120,
   }))
 
+  overlayReady = false
   overlayWindow = new BrowserWindow({
     x: savedPos.x,
     y: savedPos.y,
@@ -155,14 +246,18 @@ function createOverlay() {
     const [x, y] = overlayWindow.getPosition()
     store.set('overlayPosition', { x, y })
   })
+
+  // The overlay renderer records the audio; if its process dies, recording is
+  // broken until it's back - reload it and reset the toggle state.
+  overlayWindow.webContents.on('render-process-gone', (_e, details) => {
+    logErr('Overlay renderer gone:', details.reason)
+    overlayReady = false
+    isRecording = false
+    pendingSummarize = false
+    setTrayRecording(false)
+    overlayWindow?.webContents.reload()
+  })
 }
-
-// ── Whisper ───────────────────────────────────────────────────────────────────
-
-// Cache in the home directory, not in node_modules
-const MODEL_CACHE_DIR = path.join(app.getPath('userData'), 'model-cache')
-// Separate cache for the (optional, large) summarization GGUF.
-const LLM_CACHE_DIR = path.join(app.getPath('userData'), 'llm-cache')
 
 function sendToSettings(data) {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
@@ -186,405 +281,88 @@ function sendModelProgress(data) {
 // at app start when the first progress events fire - those would then be lost
 // (Electron doesn't buffer). The renderer reports in here as soon as it's
 // actually listening, and gets the state current at that moment replayed.
+// The flag also gates the recording hotkey: a 'start-recording' sent before
+// this point would be dropped silently and desync the toggle state.
 ipcMain.on('overlay-ready', () => {
+  overlayReady = true
   if (lastModelProgress) overlayWindow?.webContents.send('model-loading', lastModelProgress)
 })
 
-// Build the aggregating transformers.js progress_callback for a model load.
-// Multiple .onnx parts load in parallel; this reports one steady, monotonic
-// overall percentage to the tray + UI (see the inline reasoning below).
-function makeProgressCallback(modelName) {
-  const lastLoggedPct = {}
-  const fileBytes = {}
-  let lastSentPct = -1
-  return (data) => {
-    if (data.status === 'progress') {
-      const pct  = Math.round(data.progress)
-      const file = (data.file || '').split('/').pop()
-      const step = Math.floor(pct / 10) * 10
-      if (lastLoggedPct[file] !== step) {
-        lastLoggedPct[file] = step
-        log(`Download [${file}] ${step}%`)
-      }
+// ── Whisper (via worker) ──────────────────────────────────────────────────────
 
-      // Tokenizer/config files (including tokenizer.json, which depending on
-      // the model can be several MB) load completely before the actual model
-      // weights (which can take minutes) even start. A size threshold isn't
-      // enough, since tokenizer.json is sometimes larger than the weights of
-      // a "tiny" model. So only count files that contain ".onnx" in the name
-      // - that covers both "encoder_model.onnx" and, for larger models, the
-      // externalized "encoder_model.onnx_data" (ONNX external data, needed
-      // above the ~2GB protobuf limit; "endsWith('.onnx')" wouldn't match the
-      // _data variant).
-      //
-      // But even within the .onnx files the same problem recurs: the small
-      // "*.onnx" graph file (a few KB-MB) often loads completely in a single
-      // event, BEFORE the huge associated "*.onnx_data" weights file even
-      // starts - and would falsely freeze the monotonic lock below at 100%.
-      // So additionally: only count files we've already seen at <100% or are
-      // already tracking (excludes instantly-complete files on first
-      // appearance, without missing later updates of an already-running file).
-      if (file.includes('.onnx') && (pct < 100 || fileBytes[file] !== undefined)) {
-        fileBytes[file] = { loaded: data.loaded || 0, total: data.total || 0 }
-      }
-      const totals = Object.values(fileBytes).reduce(
-        (acc, f) => ({ loaded: acc.loaded + f.loaded, total: acc.total + f.total }),
-        { loaded: 0, total: 0 }
-      )
-      // totals.total === 0 means: no .onnx file seen yet, only metadata -
-      // so don't show any progress yet.
-      if (totals.total === 0) return
-      const rawPct = Math.round((totals.loaded / totals.total) * 100)
-      // As soon as another (large) file starts loading, its total size
-      // immediately enters the denominator while its loaded portion is still
-      // 0 -> the overall value can briefly jump back. Never display
-      // backwards, that would look like an error.
-      const overallPct = Math.max(rawPct, lastSentPct)
-      updateTrayLabel(`${modelName} ${overallPct}%`)
-
-      // Only send on an actual percentage change, otherwise the UI flickers
-      if (overallPct !== lastSentPct) {
-        lastSentPct = overallPct
-        sendModelProgress({ status: 'progress', progress: overallPct })
-      }
-    } else if (data.status === 'done') {
-      log(`Model status: done`, data.file || '')
-    }
-  }
-}
-
-// Create (downloading if needed) a Whisper ASR pipeline for the given model,
-// with the CoreML->CPU device fallback. Throws on failure. Used both for the
-// active dictation model (loadModel) and for temporary per-file models.
-async function buildWhisperPipeline(modelName, progress_callback) {
-  const { pipeline, env } = await import('@huggingface/transformers')
-  env.cacheDir = MODEL_CACHE_DIR
-  const modelId = `${PROVIDER}/whisper-${modelName}`
-  log(`Loading model: ${modelId}`)
-
-  // Device/dtype history (see PLAN.md background):
-  // - CoreML + fp32 + default memory allocator: hangs/crashes during
-  //   inference with real speech and larger models (medium/large).
-  // - CPU + fp32 + default allocator: same picture - onnxruntime's
-  //   BFCArena memory-pool allocator crashes (posix_memalign) on extend,
-  //   reproducible with real audio data, but ONLY in the real Electron
-  //   process (much higher memory footprint due to the GPU
-  //   process/compositor) - never in an isolated Node script.
-  // - fp16 (CoreML and CPU alike): already fails at load time with an
-  //   ONNX graph error (LayerNorm fusion/InsertedPrecisionFreeCast) - the
-  //   fp16 file itself is incompatible with this onnxruntime version,
-  //   regardless of device.
-  // - `session_options: { enableCpuMemArena: false }` disables the buggy
-  //   pool allocator (plain malloc/free instead of pooling) - fixes the
-  //   crash completely. With that, CoreML + fp32 (best quality + Apple
-  //   Silicon GPU/Neural Engine) runs reliably. CoreML + q8 still crashes
-  //   (quantization + CoreML don't get along), so fp32 for the CoreML path.
-  const preferredDevice = process.platform === 'darwin' ? 'coreml' : 'cpu'
-  try {
-    return await pipeline('automatic-speech-recognition', modelId,
-      { device: preferredDevice, dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback })
-  } catch (deviceErr) {
-    if (preferredDevice === 'cpu') throw deviceErr
-    logErr(`Device '${preferredDevice}' failed, falling back to CPU:`, errMsg(deviceErr))
-    return await pipeline('automatic-speech-recognition', modelId,
-      { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback })
-  }
-}
-
-async function loadModel(modelName, force = false) {
-  if (isLoadingModel && !force) {
-    log('loadModel: already loading, skipped')
-    return
-  }
-  // Every call gets its own generation. If a forced reload (e.g. provider
-  // change) starts while a load is still running, the older one detects after
-  // its await that it was superseded and discards its result instead of
-  // overwriting freshly loaded state.
-  const myGen = ++loadGeneration
-  isLoadingModel = true
+/**
+ * Load (or switch) the dictation model in the worker. Loads are serialized by
+ * the worker's job queue, so concurrent calls can't race each other or a
+ * running transcription. Returns (and stores in modelReadyPromise) whether the
+ * model is usable - never rejects, so fire-and-forget callers (tray menu) are
+ * safe.
+ * @param {string} modelName
+ * @returns {Promise<boolean>}
+ */
+function loadModel(modelName) {
+  loadingCount++
   updateTrayLabel(tr('tray.loading', { model: modelName }))
   overlayWindow?.showInactive()
 
-  try {
-    const modelId = `${PROVIDER}/whisper-${modelName}`
-    const pipe = await buildWhisperPipeline(modelName, makeProgressCallback(modelName))
-    // Superseded by a newer load in the meantime? Then discard the result, so
-    // we don't overwrite the model that was just freshly loaded.
-    if (myGen !== loadGeneration) {
-      log(`loadModel: ${modelId} was superseded, result discarded`)
-      return
-    }
-    whisperPipeline = pipe
-    log(`Model ready: ${modelId}`)
-    store.set('model', modelName)
-    updateTrayLabel(null)
-    buildTrayMenu()
-    sendModelProgress({ status: 'ready' })
-    setTimeout(() => overlayWindow?.hide(), 500)
-  } catch (err) {
-    // Superseded load: the error no longer belongs to the active model,
-    // discard it silently (the newer load owns the state now).
-    if (myGen !== loadGeneration) {
-      log(`loadModel: superseded load with error discarded (${errMsg(err)})`)
-      return
-    }
-    logErr('Model load error:', errMsg(err))
-    updateTrayLabel(tr('tray.loadError'))
+  modelReadyPromise = (async () => {
+    try {
+      const res = await workerRequest('load-model', { model: modelName })
+      loadedModel = res.loadedModel
+      store.set('model', modelName)
+      updateTrayLabel(null)
+      buildTrayMenu()
+      sendModelProgress({ status: 'ready' })
+      // Don't hide the pill from under a recording or a dictation that was
+      // waiting for this load and is about to transcribe.
+      setTimeout(() => { if (!isRecording && dictationCount === 0) overlayWindow?.hide() }, 500)
+      return true
+    } catch (err) {
+      logErr('Model load error:', errMsg(err))
+      updateTrayLabel(tr('tray.loadError'))
 
-    // Delete the corrupt cache so the next attempt downloads fresh
-    const corruptPath = path.join(MODEL_CACHE_DIR, PROVIDER, `whisper-${modelName}`)
-    if (fs.existsSync(corruptPath)) {
-      fs.rmSync(corruptPath, { recursive: true, force: true })
-      log('Deleted corrupt cache:', corruptPath)
-    }
-
-    sendModelProgress({ status: 'error', message: errMsg(err) })
-    overlayWindow?.hide()
-
-    // The tray tooltip alone is easily missed (e.g. when selecting via the
-    // tray menu instead of the settings) - only show a dialog when the
-    // settings are NOT currently open (they show the error themselves).
-    if (!settingsWindow || settingsWindow.isDestroyed()) {
-      dialog.showErrorBox(
-        tr('dialog.modelError.title'),
-        tr('dialog.modelError.body', { model: `${PROVIDER}/whisper-${modelName}`, error: errMsg(err) })
-      )
-    }
-  } finally {
-    // Only reset if no newer load has taken over - otherwise a superseded old
-    // run would clear the active one's flag.
-    if (myGen === loadGeneration) isLoadingModel = false
-  }
-}
-
-/**
- * @param {Float32Array} pcm
- * @param {{ maxNewTokens?: number, pipeline?: any, onProgress?: ((pct: number) => void) | null, stopper?: any }} [opts]
- */
-async function transcribe(pcm, { maxNewTokens = 440, pipeline = whisperPipeline, onProgress = null, stopper = null } = {}) {
-  if (!pipeline) return ''
-
-  const language = /** @type {string} */ (store.get('language', 'german'))
-  const durationSeconds = pcm.length / 16000
-  const genOptions = {
-    language,
-    task: 'transcribe',
-    // Whisper internally processes only a fixed 30s window - without chunking
-    // everything after that is silently cut off. chunk_length_s enables
-    // long-form transcription (overlapping 30s windows are stitched together).
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    // max_new_tokens as a safety net (per 30s chunk) against repetition loops, a
-    // known Whisper failure mode on silence/noise/unclear speech. Short dictation
-    // uses the tight default; file transcription raises it, since a dense 30s of
-    // speech (e.g. a fast speaker in a video) can exceed 440 tokens per chunk.
-    max_new_tokens: maxNewTokens,
-  }
-
-  // Dev-only PCM stats (pure log noise in production).
-  if (isDev) {
-    let min = Infinity, max = -Infinity, sumAbs = 0
-    for (let i = 0; i < pcm.length; i++) {
-      const v = pcm[i]
-      if (v < min) min = v
-      if (v > max) max = v
-      sumAbs += Math.abs(v)
-    }
-    log(`transcribe(): ${pcm.length} samples (${durationSeconds.toFixed(1)}s), ` +
-        `min=${min.toFixed(3)} max=${max.toFixed(3)} avgAbs=${(sumAbs / pcm.length).toFixed(4)}`)
-  }
-
-  // Dev-only streamer for the recognized chunk text (token-level logging is
-  // intentionally omitted: it floods the log and the token ids are a
-  // BigInt64Array that electron-log can't serialize).
-  if (isDev) {
-    const { WhisperTextStreamer } = await import('@huggingface/transformers')
-    genOptions.streamer = new WhisperTextStreamer(pipeline.tokenizer, {
-      callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
-      on_finalize: () => log(`  [streamer] Finalized`),
-    })
-  }
-
-  // Progress bar + cancellation (file transcription): the long-form pipeline
-  // calls model.generate() exactly once per 30s window. Wrap it to (a) count
-  // completed windows against the total for a real progress %, and (b) inject an
-  // InterruptableStoppingCriteria so a Stop button can abort mid-generation.
-  // WhisperTextStreamer's on_chunk_start can't drive progress - it only fires
-  // with return_timestamps and reports within-window time. This wrapper doesn't
-  // otherwise change transcription behaviour.
-  /** @type {(() => void) | null} */
-  let restoreGenerate = null
-  if (onProgress || stopper) {
-    const sr = WHISPER_SAMPLE_RATE
-    const window = sr * genOptions.chunk_length_s
-    const jump = window - 2 * sr * genOptions.stride_length_s
-    const totalChunks = pcm.length <= window ? 1 : Math.ceil((pcm.length - window) / jump) + 1
-    const model = pipeline.model
-    const origGenerate = model.generate.bind(model)
-    let done = 0
-    if (onProgress) onProgress(0)
-    model.generate = async (opts) => {
-      if (stopper?.interrupted) throw cancelledError()
-      const r = await origGenerate(stopper ? { ...opts, stopping_criteria: stopper } : opts)
-      if (stopper?.interrupted) throw cancelledError()  // interrupted mid-window
-      done += 1
-      if (onProgress) onProgress(Math.max(0, Math.min(99, Math.round((done / totalChunks) * 100))))
-      return r
-    }
-    restoreGenerate = () => { model.generate = origGenerate }
-  }
-
-  const t0 = Date.now()
-  let result
-  try {
-    result = await pipeline(pcm, genOptions)
-  } finally {
-    if (restoreGenerate) restoreGenerate()
-  }
-  log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
-  // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
-  // typographic quotes for the current language (see dictation.js).
-  return applyDictationMarkers(result.text.trim(), language)
-}
-
-// ── Summarization (local LLM via node-llama-cpp) ───────────────────────────────
-
-// Resolve the GGUF, downloading it once (with progress) if missing. Reuses the
-// same progress channel as the Whisper download so the overlay/settings show a
-// bar. createModelDownloader validates/resumes, so an already-present model
-// completes near-instantly.
-async function ensureLlmModel() {
-  const { createModelDownloader } = await import('node-llama-cpp')
-  const modelUri = /** @type {string} */ (store.get('llmModelUri', DEFAULT_LLM_URI))
-  log(`LLM model: ${modelUri}`)
-  fs.mkdirSync(LLM_CACHE_DIR, { recursive: true })
-  let lastPct = -1
-  const downloader = await createModelDownloader({
-    modelUri,
-    dirPath: LLM_CACHE_DIR,
-    onProgress: ({ totalSize, downloadedSize }) => {
-      if (!totalSize) return
-      const pct = Math.round((downloadedSize / totalSize) * 100)
-      if (pct !== lastPct) {
-        lastPct = pct
-        updateTrayLabel(`LLM ${pct}%`)
-        sendModelProgress({ status: 'progress', progress: pct })
+      // Delete the corrupt cache so the next attempt downloads fresh - but not
+      // when the worker process died (a crash says nothing about the files).
+      if (!(/** @type {any} */ (err)?.workerExit)) {
+        const corruptPath = path.join(MODEL_CACHE_DIR, PROVIDER, `whisper-${modelName}`)
+        if (fs.existsSync(corruptPath)) {
+          fs.rmSync(corruptPath, { recursive: true, force: true })
+          log('Deleted corrupt cache:', corruptPath)
+        }
       }
-    },
-  })
-  const modelPath = await downloader.download()
-  log(`LLM model ready: ${modelPath}`)
-  return modelPath
+
+      sendModelProgress({ status: 'error', message: errMsg(err) })
+      if (!isRecording && dictationCount === 0) overlayWindow?.hide()
+
+      // The tray tooltip alone is easily missed (e.g. when selecting via the
+      // tray menu instead of the settings) - only show a dialog when the
+      // settings are NOT currently open (they show the error themselves).
+      if (!settingsWindow || settingsWindow.isDestroyed()) {
+        dialog.showErrorBox(
+          tr('dialog.modelError.title'),
+          tr('dialog.modelError.body', { model: `${PROVIDER}/whisper-${modelName}`, error: errMsg(err) })
+        )
+      }
+      return false
+    } finally {
+      loadingCount--
+    }
+  })()
+  return modelReadyPromise
 }
 
-// Lazily load the LLM on first use and keep it warm. node-llama-cpp is ESM-only,
-// so it's dynamically imported (same pattern as electron-store / transformers).
-async function loadLlm() {
-  if (llmModel) return
-  if (isLoadingLlm) {
-    while (isLoadingLlm) await new Promise((r) => setTimeout(r, 100))
-    if (llmModel) return
-    throw new Error('LLM load failed')
-  }
-  isLoadingLlm = true
-  updateTrayLabel(tr('tray.loadingLlm'))
-  overlayWindow?.showInactive()
-  try {
-    const { getLlama } = await import('node-llama-cpp')
-    const modelPath = await ensureLlmModel()
-    if (!llama) llama = await getLlama()
-    llmModel = await llama.loadModel({ modelPath })
-    log('LLM loaded')
-    updateTrayLabel(null)
-    sendModelProgress({ status: 'ready' })
-    setTimeout(() => overlayWindow?.hide(), 500)
-  } catch (err) {
-    logErr('LLM load error:', errMsg(err))
-    updateTrayLabel(tr('tray.loadError'))
-    sendModelProgress({ status: 'error', message: errMsg(err) })
-    overlayWindow?.hide()
-    throw err
-  } finally {
-    isLoadingLlm = false
-  }
+function summarizeText(text, language) {
+  return workerRequest('summarize', {
+    text,
+    language,
+    llmModelUri: /** @type {string} */ (store.get('llmModelUri', DEFAULT_LLM_URI)),
+  }).then((r) => r.summary)
 }
 
-/**
- * Summarize transcribed text with the local LLM. Returns '' if the model can't
- * be loaded or produces nothing (caller then falls back to the raw transcript).
- * A fresh context is created per call and disposed afterwards so the multi-GB
- * KV cache doesn't accumulate; the model itself stays resident.
- * @param {string} text
- * @param {string} language
- * @returns {Promise<string>}
- */
-async function summarize(text, language) {
-  if (!text || !text.trim()) return ''
-  await loadLlm()
-  const { LlamaChatSession } = await import('node-llama-cpp')
-  // Single sequence -> serialize requests.
-  while (llmBusy) await new Promise((r) => setTimeout(r, 50))
-  llmBusy = true
-  /** @type {any} */ let context = null
-  try {
-    context = await llmModel.createContext({ contextSize: 4096 })
-    const session = new LlamaChatSession({
-      contextSequence: context.getSequence(),
-      systemPrompt: buildSystemPrompt(language),
-    })
-    const t0 = Date.now()
-    const out = await session.prompt(text.trim(), { maxTokens: 400, temperature: 0.3 })
-    log(`summarize(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
-    return cleanSummary(out)
-  } finally {
-    llmBusy = false
-    if (context) { try { await context.dispose() } catch { /* already gone */ } }
-  }
-}
+// ── File transcription ──────────────────────────────────────────────────────────
 
-// ── File transcription (ffmpeg -> Whisper) ─────────────────────────────────────
-
-const WHISPER_SAMPLE_RATE = 16000
 // Media containers/codecs offered in the file picker. ffmpeg decodes far more,
 // but this keeps the dialog focused on what users actually dictate/record.
 const MEDIA_EXTENSIONS = ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4a', 'mp3', 'wav', 'aac', 'flac', 'ogg', 'opus']
-
-// ffmpeg-static returns a path inside app.asar when packaged; the binary itself
-// is unpacked (see electron-builder.yml asarUnpack) and must be spawned from
-// there. In dev the path has no app.asar segment, so the replace is a no-op.
-function getFfmpegPath() {
-  const p = /** @type {unknown} */ (require('ffmpeg-static'))
-  return typeof p === 'string' ? p.replace('app.asar', 'app.asar.unpacked') : null
-}
-
-// Decode any supported media file to raw 16 kHz mono float32 PCM (what Whisper
-// expects) by streaming it through ffmpeg. Robust across containers/codecs and
-// memory-friendly for large video files, unlike the renderer's Web Audio path.
-function decodeFileToWhisperPCM(filePath) {
-  return new Promise((resolve, reject) => {
-    const ff = getFfmpegPath()
-    if (!ff) { reject(new Error('ffmpeg binary not found')); return }
-    const { spawn } = require('child_process')
-    const args = [
-      '-i', filePath,
-      '-f', 'f32le', '-ac', '1', '-ar', String(WHISPER_SAMPLE_RATE),
-      '-loglevel', 'error', 'pipe:1',
-    ]
-    const proc = spawn(ff, args)
-    /** @type {Buffer[]} */ const chunks = []
-    let stderr = ''
-    proc.stdout.on('data', (d) => chunks.push(d))
-    proc.stderr.on('data', (d) => { stderr += d.toString() })
-    proc.on('error', reject)
-    proc.on('close', (code) => {
-      if (code !== 0) { reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`)); return }
-      const buf = Buffer.concat(chunks)
-      // Reinterpret the little-endian float32 bytes as a Float32Array view.
-      const pcm = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4))
-      resolve(pcm)
-    })
-  })
-}
 
 function createResultWindow() {
   resultWindow = new BrowserWindow({
@@ -611,7 +389,16 @@ function openResultWindow() {
 }
 
 function sendFileStatus(data) {
-  lastFileStatus = data
+  if (data.status === 'progress' && lastFileStatus?.status === 'transcribing') {
+    // Merge progress into the stored 'transcribing' status instead of replacing
+    // it: a window reload replays lastFileStatus, which must keep the context
+    // (file name, model), not just a bare progress tick.
+    lastFileStatus = { ...lastFileStatus, progress: data.progress, chunk: data.chunk, totalChunks: data.totalChunks }
+  } else if (data.status !== 'busy') {
+    // 'busy' is a transient notice about a rejected second request - it must
+    // not overwrite the state of the run that's still in progress.
+    lastFileStatus = data
+  }
   resultWindow?.webContents.send('file-status', data)
 }
 
@@ -623,50 +410,33 @@ function getFileModel() {
   return MODELS.includes(m) ? m : 'small'
 }
 
-// Transcribe file PCM with the chosen model. If it's the active dictation model,
-// reuse the warm pipeline; otherwise build a temporary pipeline just for this
-// file and dispose it afterwards, leaving the dictation model loaded and active.
-async function transcribeFilePCM(pcm, modelName, onProgress, stopper) {
-  const activeModel = store.get('model', 'small')
-  if (modelName === activeModel && whisperPipeline) {
-    return transcribe(pcm, { maxNewTokens: 2048, onProgress, stopper })
-  }
-  overlayWindow?.showInactive()
-  updateTrayLabel(tr('tray.loading', { model: modelName }))
-  /** @type {any} */ let tempPipe = null
-  try {
-    tempPipe = await buildWhisperPipeline(modelName, makeProgressCallback(modelName))
-    if (stopper?.interrupted) throw cancelledError()  // cancelled during download
-    sendModelProgress({ status: 'ready' })
-    updateTrayLabel(null)
-    setTimeout(() => overlayWindow?.hide(), 300)
-    return await transcribe(pcm, { maxNewTokens: 2048, pipeline: tempPipe, onProgress, stopper })
-  } finally {
-    updateTrayLabel(null)
-    // Free the temporary model's native memory; best-effort (older transformers
-    // builds may not expose dispose()).
-    if (tempPipe && typeof tempPipe.dispose === 'function') {
-      try { await tempPipe.dispose() } catch { /* already gone */ }
-    }
-  }
-}
-
-// Orchestrate: open/focus the result window, decode the file, transcribe with
-// the selected file model, and stream status into the window. The summary is
-// offered on demand there (button).
+// Orchestrate: open/focus the result window, then let the worker decode +
+// transcribe the file and stream status into the window. Only one file job at
+// a time: a second request while one runs is rejected with a notice instead of
+// silently spawning a parallel run (or killing a possibly hours-long one).
 async function transcribeFileFlow(filePath) {
   openResultWindow()
+  if (fileJobRunning) {
+    log('File transcription refused: another one is still running')
+    sendFileStatus({ status: 'busy', message: tr('result.busy') })
+    return
+  }
+  fileJobRunning = true
   lastFilePath = filePath
   const model = getFileModel()
-  const { InterruptableStoppingCriteria } = await import('@huggingface/transformers')
-  const stopper = new InterruptableStoppingCriteria()
-  activeStopper = stopper
   sendFileStatus({ status: 'transcribing', name: path.basename(filePath), model, progress: 0 })
   try {
-    const pcm = await decodeFileToWhisperPCM(filePath)
-    log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)} (model: ${model})`)
-    const onProgress = (p) => sendFileStatus({ status: 'progress', progress: p })
-    const transcript = await transcribeFilePCM(pcm, model, onProgress, stopper)
+    // If the file model is the dictation model and that's still loading, wait
+    // for the load instead of racing it with a second pipeline build.
+    if (model === store.get('model', 'small')) await modelReadyPromise
+    const res = await workerRequest('transcribe-file', {
+      filePath,
+      model,
+      language: /** @type {string} */ (store.get('language', 'german')),
+    }, {
+      onProgress: (p) => sendFileStatus({ status: 'progress', progress: p.pct, chunk: p.chunk, totalChunks: p.totalChunks }),
+    })
+    const transcript = res.text
     log(isDev ? `File transcription: "${transcript}"` : `File transcription done (${transcript.length} chars)`)
     sendFileStatus({ status: 'done', name: path.basename(filePath), transcript, model })
   } catch (err) {
@@ -678,7 +448,8 @@ async function transcribeFileFlow(filePath) {
       sendFileStatus({ status: 'error', message: errMsg(err) })
     }
   } finally {
-    if (activeStopper === stopper) activeStopper = null
+    fileJobRunning = false
+    updateTrayLabel(null)
   }
 }
 
@@ -711,13 +482,11 @@ ipcMain.on('result-drop-file', (_e, filePath) => {
 
 ipcMain.on('result-open-file', () => openFileForTranscription())
 
-// Stop button: interrupt the running file transcription. The generate wrapper
-// checks the criteria per token and aborts at the next opportunity.
+// Stop button: interrupt the running file transcription. The worker checks the
+// stopping criteria per token and aborts at the next opportunity (or kills a
+// still-running ffmpeg decode).
 ipcMain.on('result-cancel', () => {
-  if (activeStopper) {
-    log('File transcription: stop requested')
-    activeStopper.interrupt()
-  }
+  if (fileJobRunning) worker?.postMessage({ type: 'cancel-file' })
 })
 
 // Model selector in the result window: expose the choices + current selection.
@@ -737,22 +506,20 @@ function isModelCached(model) {
 }
 
 // Download a file model in the background (no file loaded yet) so it's ready for
-// the next transcription. Progress shows in the overlay pill; the pipeline is
-// disposed right after - we only wanted to warm the on-disk cache.
+// the next transcription. Progress shows in the overlay pill; the worker
+// disposes the pipeline right after - we only want to warm the on-disk cache.
 async function preloadFileModel(model) {
   overlayWindow?.showInactive()
   updateTrayLabel(tr('tray.loading', { model }))
-  /** @type {any} */ let pipe = null
   try {
-    pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+    await workerRequest('preload-model', { model })
     sendModelProgress({ status: 'ready' })
   } catch (err) {
     logErr('File model preload error:', errMsg(err))
     sendModelProgress({ status: 'error', message: errMsg(err) })
   } finally {
     updateTrayLabel(null)
-    setTimeout(() => overlayWindow?.hide(), 500)
-    if (pipe && typeof pipe.dispose === 'function') { try { await pipe.dispose() } catch { /* gone */ } }
+    setTimeout(() => { if (!isRecording && dictationCount === 0) overlayWindow?.hide() }, 500)
   }
 }
 
@@ -778,7 +545,10 @@ ipcMain.handle('result-set-file-model', async (_e, model) => {
 
   store.set('fileModel', model)
   log('File model set:', model)
-  if (lastFilePath) {
+  if (fileJobRunning) {
+    // A run is in progress (the dropdown is disabled then, but stay safe):
+    // the new model simply applies to the next transcription.
+  } else if (lastFilePath) {
     transcribeFileFlow(lastFilePath)          // re-transcribes (downloads if needed)
   } else if (!isModelCached(model)) {
     preloadFileModel(model)                   // no file yet -> download now as confirmed
@@ -792,7 +562,7 @@ ipcMain.on('result-copy', (_e, text) => {
 
 ipcMain.handle('result-summarize', async (_e, text) => {
   const language = /** @type {string} */ (store.get('language', 'german'))
-  return summarize(String(text || ''), language)
+  return summarizeText(String(text || ''), language)
 })
 
 ipcMain.handle('result-save', async (_e, text) => {
@@ -873,7 +643,7 @@ ipcMain.on('i18n-sync', (e) => { e.returnValue = translations })
 
 // ── Model cache ────────────────────────────────────────────────────────────────
 // Cached models live as `<provider>/whisper-<model>/` folders under
-// MODEL_CACHE_DIR (see env.cacheDir in loadModel). Determine the size per
+// MODEL_CACHE_DIR (see env.cacheDir in the worker). Determine the size per
 // folder and allow deletion so large models don't silently fill the disk.
 
 function getDirSize(dir) {
@@ -896,7 +666,7 @@ function getDirSize(dir) {
 function isModelLocked(provider, model) {
   return provider === PROVIDER &&
          model === store.get('model', 'small') &&
-         (whisperPipeline !== null || isLoadingModel)
+         (loadedModel !== null || loadingCount > 0)
 }
 
 function listCachedModels() {
@@ -986,12 +756,19 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
   // this one is still transcribing/summarizing.
   const summarizeMode = pendingSummarize
   pendingSummarize = false
+  dictationCount++
   overlayWindow?.webContents.send('transcribing')
 
   const language = /** @type {string} */ (store.get('language', 'german'))
   let transcript = ''
   try {
-    transcript = await transcribe(Float32Array.from(pcm))
+    // Recording is allowed while the model still loads - so wait for the load
+    // before transcribing (the overlay shows the load progress meanwhile).
+    const modelOk = await modelReadyPromise
+    if (!modelOk && !loadedModel) throw new Error('No model loaded')
+    overlayWindow?.webContents.send('transcribing')
+    const res = await workerRequest('transcribe', { pcm, language, maxNewTokens: 440 })
+    transcript = res.text
     // Only log the recognized text in dev mode (privacy for dictation).
     log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
   } catch (err) {
@@ -1005,47 +782,58 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
   if (summarizeMode && transcript) {
     overlayWindow?.webContents.send('summarizing')
     try {
-      const summary = await summarize(transcript, language)
+      const summary = await summarizeText(transcript, language)
       if (summary) { toPaste = summary; summarized = true }
     } catch (err) {
       logErr('Summarization error:', errMsg(err))
     }
   }
 
-  if (toPaste) {
-    // Save the old clipboard content
-    const prev = clipboard.readText()
-    clipboard.writeText(toPaste)
+  try {
+    if (toPaste) {
+      // Save the old clipboard content
+      const prev = clipboard.readText()
+      clipboard.writeText(toPaste)
 
-    // Briefly let the window lose focus, then simulate paste
-    overlayWindow?.hide()
-    await new Promise(r => setTimeout(r, 80))
+      // Briefly let the window lose focus, then simulate paste
+      overlayWindow?.hide()
+      await new Promise(r => setTimeout(r, 80))
 
-    const { keyboard, Key } = require('@nut-tree-fork/nut-js')
-    const isMac = process.platform === 'darwin'
-    if (isMac) {
-      await keyboard.pressKey(Key.LeftSuper, Key.V)
-      await keyboard.releaseKey(Key.LeftSuper, Key.V)
-    } else {
-      await keyboard.pressKey(Key.LeftControl, Key.V)
-      await keyboard.releaseKey(Key.LeftControl, Key.V)
+      const { keyboard, Key } = require('@nut-tree-fork/nut-js')
+      const isMac = process.platform === 'darwin'
+      if (isMac) {
+        await keyboard.pressKey(Key.LeftSuper, Key.V)
+        await keyboard.releaseKey(Key.LeftSuper, Key.V)
+      } else {
+        await keyboard.pressKey(Key.LeftControl, Key.V)
+        await keyboard.releaseKey(Key.LeftControl, Key.V)
+      }
+
+      // After pasting the summary, leave the full transcript on the clipboard as a
+      // fallback; for a plain dictation, restore the user's previous clipboard.
+      setTimeout(() => clipboard.writeText(summarized ? transcript : prev), 500)
     }
-
-    // After pasting the summary, leave the full transcript on the clipboard as a
-    // fallback; for a plain dictation, restore the user's previous clipboard.
-    setTimeout(() => clipboard.writeText(summarized ? transcript : prev), 500)
+  } catch (err) {
+    // Auto-paste failed (e.g. Accessibility revoked after startup) - the text
+    // is still on the clipboard for a manual paste. Never skip the reset below,
+    // otherwise the overlay pill stays stuck in 'transcribing'.
+    logErr('Paste error:', errMsg(err))
+  } finally {
+    dictationCount--
+    overlayWindow?.webContents.send('done')
+    // Don't hide if the user has already started the next recording (or a
+    // second dictation flow is still running).
+    setTimeout(() => { if (!isRecording && dictationCount === 0) overlayWindow?.hide() }, 700)
   }
-
-  overlayWindow?.webContents.send('done')
-  setTimeout(() => overlayWindow?.hide(), 700)
 })
 
 // Renderer reports that recording couldn't start (e.g. microphone permission
-// denied). Reset overlay/tray and the worker toggle, otherwise the state stays
-// stuck (the next ⌥Space would only resync).
+// denied) or produced no usable audio. Reset overlay/tray and the toggle,
+// otherwise the state stays stuck (the next ⌥Space would only resync).
 ipcMain.on('recording-failed', (_e, message) => {
   logErr('Recording failed (renderer):', message)
   isRecording = false
+  pendingSummarize = false
   setTrayRecording(false)
   overlayWindow?.hide()
   if (!settingsWindow || settingsWindow.isDestroyed()) {
@@ -1136,11 +924,20 @@ function toggleRecording(summarizeMode = false) {
   lastToggleAt = now
 
   if (!isRecording) {
-    // While the model is still loading, whisperPipeline is either null or being
-    // reassigned - don't start recording, otherwise the audio is lost or
-    // transcribe() finds no model. Just don't flip the toggle.
-    if (isLoadingModel) {
-      log('Recording ignored: model still loading')
+    // The overlay renderer does the recording. Until it has loaded and is
+    // listening, 'start-recording' would be dropped silently (Electron doesn't
+    // buffer webContents.send) and the toggle state would desync.
+    if (!overlayReady) {
+      log('Recording ignored: overlay renderer not ready yet')
+      return
+    }
+    // Recording itself doesn't need the model - transcription waits for the
+    // load in 'audio-ready'. But when there is no model and none is loading
+    // (the load failed), transcription could never follow: retry the load
+    // (with visible progress) instead of recording into the void.
+    if (!loadedModel && loadingCount === 0) {
+      log('Recording refused: no model loaded - retrying model load')
+      loadModel(/** @type {string} */ (store.get('model', 'small')))
       return
     }
     pendingSummarize = summarizeMode
@@ -1222,6 +1019,7 @@ app.whenReady().then(async () => {
   log(`Log file: ${elog.transports.file.getFile()?.path}`)
   createTray()
   createOverlay()
+  spawnWorker()
   checkAccessibilityForPaste()
   setupHotkey()
 
@@ -1234,4 +1032,10 @@ app.whenReady().then(async () => {
 // event, so keep calling preventDefault to keep the tray app alive.
 app.on('window-all-closed', /** @type {() => void} */ ((e) => /** @type {any} */ (e).preventDefault())) // tray app stays open
 
-app.on('will-quit', () => { globalShortcut.unregisterAll() })
+app.on('before-quit', () => { quitting = true })
+
+app.on('will-quit', () => {
+  quitting = true
+  globalShortcut.unregisterAll()
+  worker?.kill()
+})

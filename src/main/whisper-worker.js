@@ -1,0 +1,545 @@
+// Whisper/LLM worker — runs in an Electron utilityProcess (plain Node context),
+// forked from main.js. All heavy work lives here: model loading (ONNX session
+// creation), mel-spectrogram + Whisper inference, ffmpeg decoding of media
+// files, and the node-llama-cpp summarization model. Keeping this out of the
+// main process serves two purposes:
+//  - the main process event loop stays free (tray, windows and IPC remain
+//    responsive during minute-long transcriptions), and
+//  - a native crash (onnxruntime/llama.cpp) kills only this process; main
+//    detects the exit, resets state and respawns the worker.
+//
+// Protocol (structured-clone messages over process.parentPort):
+//   in : { type: 'init', cacheDir, llmCacheDir, isDev }
+//        { type: 'load-model',      id, model }
+//        { type: 'preload-model',   id, model }
+//        { type: 'transcribe',      id, pcm, language, maxNewTokens }
+//        { type: 'transcribe-file', id, filePath, model, language }
+//        { type: 'cancel-file' }                 // cancels the active file job
+//        { type: 'summarize',       id, text, language, llmModelUri }
+//   out: { type: 'result', id, ok, value?, error?, cancelled? }
+//        { type: 'progress', id, pct, chunk, totalChunks }   // file jobs
+//        { type: 'model-progress', model, data }             // download/load
+// Logging goes through console.log/console.error; main pipes stdout/stderr
+// into electron-log.
+
+const path = require('path')
+const fs = require('fs')
+const { spawn } = require('child_process')
+const { applyDictationMarkers } = require('../shared/dictation')
+const { buildSystemPrompt, cleanSummary } = require('../shared/summarize')
+
+const parentPort = /** @type {any} */ (process).parentPort
+
+function post(msg) { parentPort.postMessage(msg) }
+function log(...args) { console.log(...args) }
+function logErr(...args) { console.error(...args) }
+
+/** @param {unknown} e */
+function errMsg(e) { return e instanceof Error ? e.message : String(e) }
+
+// Marker error for a user-cancelled transcription (distinguished from real
+// failures so the UI can reset quietly instead of showing an error).
+function cancelledError() {
+  const e = /** @type {any} */ (new Error('cancelled'))
+  e.cancelled = true
+  return e
+}
+
+// ── Config / state ──────────────────────────────────────────────────────────────
+
+/** @type {{ cacheDir: string, llmCacheDir: string, isDev: boolean }} */
+let cfg = { cacheDir: '', llmCacheDir: '', isDev: false }
+
+const PROVIDER = 'Xenova'
+const WHISPER_SAMPLE_RATE = 16000
+
+/** @type {any} */ let whisperPipeline = null
+/** @type {string | null} */ let loadedModel = null
+
+// Serializes everything that touches the shared dictation pipeline: model
+// loads/swaps, dictation transcriptions and file transcriptions that reuse the
+// warm pipeline. An ONNX session must never run two generations concurrently,
+// and the progress wrapper below monkey-patches model.generate — both are only
+// safe strictly one after another. Temp-pipeline file jobs and the LLM run
+// outside this chain (independent sessions).
+let chain = Promise.resolve()
+function enqueue(fn) {
+  const run = chain.then(fn, fn)
+  chain = run.then(() => {}, () => {}) // keep the chain alive after a failure
+  return run
+}
+
+// The one running (or decoding) file-transcription job; 'cancel-file' aborts it.
+/** @type {{ id: number, cancelled: boolean, stopper: any, ffmpeg: import('child_process').ChildProcess | null } | null} */
+let activeFileJob = null
+
+// ── Whisper ─────────────────────────────────────────────────────────────────────
+
+// Build the aggregating transformers.js progress_callback for a model load.
+// Multiple .onnx parts load in parallel; this reports one steady, monotonic
+// overall percentage (see the inline reasoning below).
+function makeProgressCallback(modelName) {
+  const lastLoggedPct = {}
+  const fileBytes = {}
+  let lastSentPct = -1
+  return (data) => {
+    if (data.status === 'progress') {
+      const pct  = Math.round(data.progress)
+      const file = (data.file || '').split('/').pop()
+      const step = Math.floor(pct / 10) * 10
+      if (lastLoggedPct[file] !== step) {
+        lastLoggedPct[file] = step
+        log(`Download [${file}] ${step}%`)
+      }
+
+      // Tokenizer/config files (including tokenizer.json, which depending on
+      // the model can be several MB) load completely before the actual model
+      // weights (which can take minutes) even start. A size threshold isn't
+      // enough, since tokenizer.json is sometimes larger than the weights of
+      // a "tiny" model. So only count files that contain ".onnx" in the name
+      // - that covers both "encoder_model.onnx" and, for larger models, the
+      // externalized "encoder_model.onnx_data" (ONNX external data, needed
+      // above the ~2GB protobuf limit; "endsWith('.onnx')" wouldn't match the
+      // _data variant).
+      //
+      // But even within the .onnx files the same problem recurs: the small
+      // "*.onnx" graph file (a few KB-MB) often loads completely in a single
+      // event, BEFORE the huge associated "*.onnx_data" weights file even
+      // starts - and would falsely freeze the monotonic lock below at 100%.
+      // So additionally: only count files we've already seen at <100% or are
+      // already tracking (excludes instantly-complete files on first
+      // appearance, without missing later updates of an already-running file).
+      if (file.includes('.onnx') && (pct < 100 || fileBytes[file] !== undefined)) {
+        fileBytes[file] = { loaded: data.loaded || 0, total: data.total || 0 }
+      }
+      const totals = Object.values(fileBytes).reduce(
+        (acc, f) => ({ loaded: acc.loaded + f.loaded, total: acc.total + f.total }),
+        { loaded: 0, total: 0 }
+      )
+      // totals.total === 0 means: no .onnx file seen yet, only metadata -
+      // so don't show any progress yet.
+      if (totals.total === 0) return
+      const rawPct = Math.round((totals.loaded / totals.total) * 100)
+      // As soon as another (large) file starts loading, its total size
+      // immediately enters the denominator while its loaded portion is still
+      // 0 -> the overall value can briefly jump back. Never display
+      // backwards, that would look like an error.
+      const overallPct = Math.max(rawPct, lastSentPct)
+
+      // Only send on an actual percentage change, otherwise the UI flickers
+      if (overallPct !== lastSentPct) {
+        lastSentPct = overallPct
+        post({ type: 'model-progress', model: modelName, data: { status: 'progress', progress: overallPct } })
+      }
+    } else if (data.status === 'done') {
+      log(`Model status: done`, data.file || '')
+    }
+  }
+}
+
+// Create (downloading if needed) a Whisper ASR pipeline for the given model,
+// with the CoreML->CPU device fallback. Throws on failure. Used both for the
+// active dictation model and for temporary per-file models.
+async function buildWhisperPipeline(modelName, progress_callback) {
+  const { pipeline, env } = await import('@huggingface/transformers')
+  env.cacheDir = cfg.cacheDir
+  const modelId = `${PROVIDER}/whisper-${modelName}`
+  log(`Loading model: ${modelId}`)
+
+  // Device/dtype history (see PLAN.md background):
+  // - CoreML + fp32 + default memory allocator: hangs/crashes during
+  //   inference with real speech and larger models (medium/large).
+  // - CPU + fp32 + default allocator: same picture - onnxruntime's
+  //   BFCArena memory-pool allocator crashes (posix_memalign) on extend,
+  //   reproducible with real audio data, but ONLY in the real Electron
+  //   process (much higher memory footprint due to the GPU
+  //   process/compositor) - never in an isolated Node script.
+  // - fp16 (CoreML and CPU alike): already fails at load time with an
+  //   ONNX graph error (LayerNorm fusion/InsertedPrecisionFreeCast) - the
+  //   fp16 file itself is incompatible with this onnxruntime version,
+  //   regardless of device.
+  // - `session_options: { enableCpuMemArena: false }` disables the buggy
+  //   pool allocator (plain malloc/free instead of pooling) - fixes the
+  //   crash completely. With that, CoreML + fp32 (best quality + Apple
+  //   Silicon GPU/Neural Engine) runs reliably. CoreML + q8 still crashes
+  //   (quantization + CoreML don't get along), so fp32 for the CoreML path.
+  // - 'large' is excluded from CoreML entirely: its fp32 weights exceed the
+  //   2GB protobuf limit and use ONNX external data (*.onnx_data), which the
+  //   CoreML EP cannot initialize ("model_path must not be empty") - every
+  //   attempt deterministically mapped gigabytes and then failed (log-proven),
+  //   so skip straight to the CPU/q8 path.
+  const useCoreml = process.platform === 'darwin' && modelName !== 'large'
+  const progress_cb = progress_callback || makeProgressCallback(modelName)
+  if (useCoreml) {
+    try {
+      return await pipeline('automatic-speech-recognition', modelId,
+        { device: 'coreml', dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback: progress_cb })
+    } catch (deviceErr) {
+      logErr(`Device 'coreml' failed, falling back to CPU:`, errMsg(deviceErr))
+    }
+  }
+  return await pipeline('automatic-speech-recognition', modelId,
+    { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback: progress_cb })
+}
+
+/**
+ * @param {any} pipeline
+ * @param {Float32Array} pcm
+ * @param {{ language: string, maxNewTokens?: number, onProgress?: ((pct: number, chunk: number, totalChunks: number) => void) | null, stopper?: any }} opts
+ */
+async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgress = null, stopper = null }) {
+  const durationSeconds = pcm.length / WHISPER_SAMPLE_RATE
+  const genOptions = {
+    language,
+    task: 'transcribe',
+    // Whisper internally processes only a fixed 30s window - without chunking
+    // everything after that is silently cut off. chunk_length_s enables
+    // long-form transcription (overlapping 30s windows are stitched together).
+    chunk_length_s: 30,
+    stride_length_s: 5,
+    // max_new_tokens as a safety net (per 30s chunk) against repetition loops, a
+    // known Whisper failure mode on silence/noise/unclear speech. Short dictation
+    // uses the tight default; file transcription raises it, since a dense 30s of
+    // speech (e.g. a fast speaker in a video) can exceed 440 tokens per chunk.
+    // Hard ceiling: Whisper's decoder has only 448 positional embeddings
+    // (max_target_positions/max_length = 448). Going past that (e.g. the former
+    // 2048) crashes the decoder self-attention reshape once a dense chunk decodes
+    // beyond position 448 ("input_shape_size == size was false", KV cache runs to
+    // a 0 dimension). The pipeline enforces the cap itself, but we clamp defensively.
+    max_new_tokens: Math.min(maxNewTokens, 444),
+  }
+
+  // Dev-only PCM stats (pure log noise in production).
+  if (cfg.isDev) {
+    let min = Infinity, max = -Infinity, sumAbs = 0
+    for (let i = 0; i < pcm.length; i++) {
+      const v = pcm[i]
+      if (v < min) min = v
+      if (v > max) max = v
+      sumAbs += Math.abs(v)
+    }
+    log(`transcribe(): ${pcm.length} samples (${durationSeconds.toFixed(1)}s), ` +
+        `min=${min.toFixed(3)} max=${max.toFixed(3)} avgAbs=${(sumAbs / pcm.length).toFixed(4)}`)
+  }
+
+  // Dev-only streamer for the recognized chunk text (token-level logging is
+  // intentionally omitted: it floods the log).
+  if (cfg.isDev) {
+    const { WhisperTextStreamer } = await import('@huggingface/transformers')
+    genOptions.streamer = new WhisperTextStreamer(pipeline.tokenizer, {
+      callback_function: (text) => log(`  [streamer] Text:`, JSON.stringify(text)),
+      on_finalize: () => log(`  [streamer] Finalized`),
+    })
+  }
+
+  // Progress bar + cancellation (file transcription): the long-form pipeline
+  // calls model.generate() exactly once per 30s window. Wrap it to (a) count
+  // completed windows against the total for a real progress %, and (b) inject an
+  // InterruptableStoppingCriteria so a Stop button can abort mid-generation.
+  // WhisperTextStreamer's on_chunk_start can't drive progress - it only fires
+  // with return_timestamps and reports within-window time. This wrapper doesn't
+  // otherwise change transcription behaviour. Safe here because the enqueue()
+  // chain guarantees only one generation runs on this pipeline at a time.
+  /** @type {(() => void) | null} */
+  let restoreGenerate = null
+  if (onProgress || stopper) {
+    const sr = WHISPER_SAMPLE_RATE
+    const window = sr * genOptions.chunk_length_s
+    const jump = window - 2 * sr * genOptions.stride_length_s
+    const totalChunks = pcm.length <= window ? 1 : Math.ceil((pcm.length - window) / jump) + 1
+    const model = pipeline.model
+    const origGenerate = model.generate.bind(model)
+    let done = 0
+    if (onProgress) onProgress(0, 0, totalChunks)
+    model.generate = async (opts) => {
+      if (stopper?.interrupted) throw cancelledError()
+      const r = await origGenerate(stopper ? { ...opts, stopping_criteria: stopper } : opts)
+      if (stopper?.interrupted) throw cancelledError()  // interrupted mid-window
+      done += 1
+      if (onProgress) onProgress(Math.max(0, Math.min(99, Math.round((done / totalChunks) * 100))), done, totalChunks)
+      return r
+    }
+    restoreGenerate = () => { model.generate = origGenerate }
+  }
+
+  const t0 = Date.now()
+  let result
+  try {
+    result = await pipeline(pcm, genOptions)
+  } finally {
+    if (restoreGenerate) restoreGenerate()
+  }
+  log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
+  // typographic quotes for the current language (see dictation.js).
+  return applyDictationMarkers(result.text.trim(), language)
+}
+
+async function disposePipeline(pipe) {
+  // Best-effort (older transformers builds may not expose dispose()).
+  if (pipe && typeof pipe.dispose === 'function') {
+    try { await pipe.dispose() } catch { /* already gone */ }
+  }
+}
+
+// ── File decoding (ffmpeg) ──────────────────────────────────────────────────────
+
+// ffmpeg-static returns a path inside app.asar when packaged; the binary itself
+// is unpacked (see electron-builder.yml asarUnpack) and must be spawned from
+// there. In dev the path has no app.asar segment, so the replace is a no-op.
+function getFfmpegPath() {
+  const p = /** @type {unknown} */ (require('ffmpeg-static'))
+  return typeof p === 'string' ? p.replace('app.asar', 'app.asar.unpacked') : null
+}
+
+// Decode any supported media file to raw 16 kHz mono float32 PCM (what Whisper
+// expects) by streaming it through ffmpeg. Robust across containers/codecs and
+// memory-friendly for large video files. `job.ffmpeg` is set so 'cancel-file'
+// can kill a decode that's still running.
+function decodeFileToWhisperPCM(filePath, job) {
+  return new Promise((resolve, reject) => {
+    const ff = getFfmpegPath()
+    if (!ff) { reject(new Error('ffmpeg binary not found')); return }
+    const args = [
+      '-i', filePath,
+      '-f', 'f32le', '-ac', '1', '-ar', String(WHISPER_SAMPLE_RATE),
+      '-loglevel', 'error', 'pipe:1',
+    ]
+    const proc = spawn(ff, args)
+    if (job) job.ffmpeg = proc
+    /** @type {Buffer[]} */ const chunks = []
+    let stderr = ''
+    proc.stdout.on('data', (d) => chunks.push(d))
+    proc.stderr.on('data', (d) => { stderr += d.toString() })
+    proc.on('error', reject)
+    proc.on('close', (code) => {
+      if (job) job.ffmpeg = null
+      if (job?.cancelled) { reject(cancelledError()); return }
+      if (code !== 0) { reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`)); return }
+      const buf = Buffer.concat(chunks)
+      // Reinterpret the little-endian float32 bytes as a Float32Array view.
+      const pcm = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4))
+      resolve(pcm)
+    })
+  })
+}
+
+// ── Local LLM (summarization, node-llama-cpp) ──────────────────────────────────
+
+/** @type {any} */ let llama = null       // getLlama() runtime handle
+/** @type {any} */ let llmModel = null    // loaded GGUF model, kept warm between summaries
+let isLoadingLlm = false
+let llmBusy = false            // single context sequence -> one summarize at a time
+
+// Resolve the GGUF, downloading it once (with progress) if missing.
+// createModelDownloader validates/resumes, so an already-present model
+// completes near-instantly.
+async function ensureLlmModel(modelUri) {
+  const { createModelDownloader } = await import('node-llama-cpp')
+  log(`LLM model: ${modelUri}`)
+  fs.mkdirSync(cfg.llmCacheDir, { recursive: true })
+  let lastPct = -1
+  const downloader = await createModelDownloader({
+    modelUri,
+    dirPath: cfg.llmCacheDir,
+    onProgress: ({ totalSize, downloadedSize }) => {
+      if (!totalSize) return
+      const pct = Math.round((downloadedSize / totalSize) * 100)
+      if (pct !== lastPct) {
+        lastPct = pct
+        post({ type: 'model-progress', model: 'LLM', data: { status: 'progress', progress: pct } })
+      }
+    },
+  })
+  const modelPath = await downloader.download()
+  log(`LLM model ready: ${modelPath}`)
+  return modelPath
+}
+
+// Lazily load the LLM on first use and keep it warm.
+async function loadLlm(modelUri) {
+  if (llmModel) return
+  if (isLoadingLlm) {
+    while (isLoadingLlm) await new Promise((r) => setTimeout(r, 100))
+    if (llmModel) return
+    throw new Error('LLM load failed')
+  }
+  isLoadingLlm = true
+  try {
+    const { getLlama } = await import('node-llama-cpp')
+    const modelPath = await ensureLlmModel(modelUri)
+    if (!llama) llama = await getLlama()
+    llmModel = await llama.loadModel({ modelPath })
+    log('LLM loaded')
+  } finally {
+    isLoadingLlm = false
+  }
+}
+
+/**
+ * Summarize transcribed text with the local LLM. Returns '' for empty input.
+ * A fresh context is created per call and disposed afterwards so the multi-GB
+ * KV cache doesn't accumulate; the model itself stays resident.
+ */
+async function summarize(text, language, modelUri) {
+  if (!text || !text.trim()) return ''
+  await loadLlm(modelUri)
+  const { LlamaChatSession } = await import('node-llama-cpp')
+  // Single sequence -> serialize requests.
+  while (llmBusy) await new Promise((r) => setTimeout(r, 50))
+  llmBusy = true
+  /** @type {any} */ let context = null
+  try {
+    context = await llmModel.createContext({ contextSize: 4096 })
+    const session = new LlamaChatSession({
+      contextSequence: context.getSequence(),
+      systemPrompt: buildSystemPrompt(language),
+    })
+    const t0 = Date.now()
+    const out = await session.prompt(text.trim(), { maxTokens: 400, temperature: 0.3 })
+    log(`summarize(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+    return cleanSummary(out)
+  } finally {
+    llmBusy = false
+    if (context) { try { await context.dispose() } catch { /* already gone */ } }
+  }
+}
+
+// ── Message handlers ────────────────────────────────────────────────────────────
+
+function ok(id, value) { post({ type: 'result', id, ok: true, value }) }
+function fail(id, err) {
+  post({ type: 'result', id, ok: false, error: errMsg(err), cancelled: !!(/** @type {any} */ (err)?.cancelled) })
+}
+
+// Load (or switch) the dictation model. Serialized on the chain, so a load can
+// never race another load or a running transcription. On failure the previous
+// pipeline stays loaded and usable; the result reports which model is active.
+async function handleLoadModel({ id, model }) {
+  try {
+    await enqueue(async () => {
+      const pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+      const old = whisperPipeline
+      whisperPipeline = pipe
+      loadedModel = model
+      log(`Model ready: ${PROVIDER}/whisper-${model}`)
+      // Free the previous model's native memory - without this every model
+      // switch stacks another multi-GB session (memory pressure was one source
+      // of the allocator crashes).
+      await disposePipeline(old)
+    })
+    ok(id, { loadedModel })
+  } catch (err) {
+    logErr('Model load error:', errMsg(err))
+    fail(id, err)
+  }
+}
+
+// Warm the on-disk cache for a file model (no file loaded yet); the pipeline
+// is disposed right after.
+async function handlePreloadModel({ id, model }) {
+  /** @type {any} */ let pipe = null
+  try {
+    pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+    ok(id, {})
+  } catch (err) {
+    logErr('File model preload error:', errMsg(err))
+    fail(id, err)
+  } finally {
+    await disposePipeline(pipe)
+  }
+}
+
+// Dictation transcription on the warm pipeline (queued).
+async function handleTranscribe({ id, pcm, language, maxNewTokens }) {
+  try {
+    const text = await enqueue(() => {
+      if (!whisperPipeline) throw new Error('No model loaded')
+      const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm)
+      return transcribe(whisperPipeline, samples, { language, maxNewTokens })
+    })
+    ok(id, { text })
+  } catch (err) {
+    fail(id, err)
+  }
+}
+
+// File transcription: decode via ffmpeg, then transcribe. If the requested
+// model is the loaded dictation model, reuse the warm pipeline (queued);
+// otherwise build a temporary pipeline that runs independently of the chain
+// (own ONNX session) and dispose it afterwards.
+async function handleTranscribeFile({ id, filePath, model, language }) {
+  const job = { id, cancelled: false, stopper: /** @type {any} */ (null), ffmpeg: /** @type {any} */ (null) }
+  activeFileJob = job
+  try {
+    const { InterruptableStoppingCriteria } = await import('@huggingface/transformers')
+    job.stopper = new InterruptableStoppingCriteria()
+    if (job.cancelled) throw cancelledError()
+
+    const pcm = await decodeFileToWhisperPCM(filePath, job)
+    log(`File decoded: ${(pcm.length / WHISPER_SAMPLE_RATE).toFixed(1)}s from ${path.basename(filePath)} (model: ${model})`)
+    if (job.cancelled) throw cancelledError()
+
+    const onProgress = (pct, chunk, totalChunks) => post({ type: 'progress', id, pct, chunk, totalChunks })
+    const opts = { language, maxNewTokens: 444, onProgress, stopper: job.stopper }
+
+    let text
+    if (model === loadedModel && whisperPipeline) {
+      text = await enqueue(() => {
+        if (job.cancelled) throw cancelledError() // cancelled while queued
+        return transcribe(whisperPipeline, pcm, opts)
+      })
+    } else {
+      /** @type {any} */ let tempPipe = null
+      try {
+        tempPipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+        if (job.cancelled) throw cancelledError() // cancelled during download
+        post({ type: 'model-progress', model, data: { status: 'ready' } })
+        text = await transcribe(tempPipe, pcm, opts)
+      } finally {
+        await disposePipeline(tempPipe)
+      }
+    }
+    ok(id, { text })
+  } catch (err) {
+    if (!(/** @type {any} */ (err)?.cancelled)) logErr('File transcription error:', errMsg(err))
+    fail(id, err)
+  } finally {
+    if (activeFileJob === job) activeFileJob = null
+  }
+}
+
+function handleCancelFile() {
+  if (!activeFileJob) return
+  log('File transcription: stop requested')
+  activeFileJob.cancelled = true
+  activeFileJob.stopper?.interrupt()
+  try { activeFileJob.ffmpeg?.kill('SIGKILL') } catch { /* already exited */ }
+}
+
+async function handleSummarize({ id, text, language, llmModelUri }) {
+  try {
+    const summary = await summarize(String(text || ''), language, llmModelUri)
+    ok(id, { summary })
+  } catch (err) {
+    logErr('Summarization error:', errMsg(err))
+    fail(id, err)
+  }
+}
+
+parentPort.on('message', (e) => {
+  const msg = e.data
+  switch (msg?.type) {
+    case 'init':
+      cfg = { cacheDir: msg.cacheDir, llmCacheDir: msg.llmCacheDir, isDev: !!msg.isDev }
+      log(`Whisper worker ready (pid ${process.pid})`)
+      break
+    case 'load-model':      handleLoadModel(msg); break
+    case 'preload-model':   handlePreloadModel(msg); break
+    case 'transcribe':      handleTranscribe(msg); break
+    case 'transcribe-file': handleTranscribeFile(msg); break
+    case 'cancel-file':     handleCancelFile(); break
+    case 'summarize':       handleSummarize(msg); break
+    default:                logErr('Unknown worker message:', JSON.stringify(msg))
+  }
+})

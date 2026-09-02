@@ -231,12 +231,15 @@
       setTimeout(() => span.remove(), 1500)
     }
 
-    function setProgress(pct) {
+    function setProgress(pct, chunk, totalChunks) {
       $('progress').classList.add('visible')
       $('btn-stop').disabled = false
       const p = Math.max(0, Math.min(100, Math.round(pct)))
       $('progress-fill').style.width = `${p}%`
-      $('progress-pct').textContent = `${p}%`
+      // Long files with a big model can take minutes per 30s segment - without
+      // the segment counter, 0% looks like a hang.
+      const chunkInfo = totalChunks ? ` · ${T('result.chunk', { done: chunk || 0, total: totalChunks })}` : ''
+      $('progress-pct').textContent = `${p}%${chunkInfo}`
     }
     function hideProgress() { $('progress').classList.remove('visible') }
 
@@ -254,9 +257,13 @@
         $('transcript-section').classList.add('hidden')
         $('summary-section').classList.add('hidden')
         setBusyStatus(T('result.transcribing', { name: data.name || '' }))
-        setProgress(data.progress || 0)
+        setProgress(data.progress || 0, data.chunk, data.totalChunks)
       } else if (data.status === 'progress') {
-        setProgress(data.progress || 0)
+        setProgress(data.progress || 0, data.chunk, data.totalChunks)
+      } else if (data.status === 'busy') {
+        // A second request was rejected while a run is in progress: show the
+        // notice but keep the running job's progress UI untouched.
+        setStatus(data.message || '', true)
       } else if (data.status === 'done') {
         $('file-model').disabled = false
         hideProgress()
