@@ -79,6 +79,7 @@ let lastFileStatus = null      // replayed to the result window once it's listen
 /** @type {string | null} */
 let lastFilePath = null        // remembered so a model change can re-transcribe it
 let fileJobRunning = false     // one file transcription at a time
+let fileBusyNotified = false   // the "dictation unavailable during file job" hint was shown
 let overlayReady = false       // the overlay renderer is loaded and listening
 /** @type {string | null} */
 let loadedModel = null         // mirror of the worker's loaded dictation model
@@ -449,6 +450,7 @@ async function transcribeFileFlow(filePath) {
     }
   } finally {
     fileJobRunning = false
+    fileBusyNotified = false
     updateTrayLabel(null)
   }
 }
@@ -929,6 +931,21 @@ function toggleRecording(summarizeMode = false) {
     // buffer webContents.send) and the toggle state would desync.
     if (!overlayReady) {
       log('Recording ignored: overlay renderer not ready yet')
+      return
+    }
+    // While a file transcription runs, the worker queue would hold a dictation
+    // until the file is done - potentially hours later, pasting into whatever
+    // has focus then. Refuse the recording instead and say so (once per job).
+    if (fileJobRunning) {
+      log('Recording refused: file transcription running')
+      if (!fileBusyNotified) {
+        fileBusyNotified = true
+        dialog.showMessageBox({
+          type: 'info',
+          title: tr('dialog.fileBusy.title'),
+          message: tr('dialog.fileBusy.body'),
+        })
+      }
       return
     }
     // Recording itself doesn't need the model - transcription waits for the

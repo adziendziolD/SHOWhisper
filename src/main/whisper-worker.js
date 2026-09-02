@@ -282,6 +282,24 @@ async function disposePipeline(pipe) {
   }
 }
 
+// Rebuild the dictation pipeline if it was freed to make room for a temp file
+// model (see handleTranscribeFile/handlePreloadModel). Must run on the chain.
+async function ensureDictationPipeline() {
+  if (whisperPipeline || !loadedModel) return
+  whisperPipeline = await buildWhisperPipeline(loadedModel, makeProgressCallback(loadedModel))
+  log(`Dictation model reloaded: ${PROVIDER}/whisper-${loadedModel}`)
+  post({ type: 'model-progress', model: loadedModel, data: { status: 'ready' } })
+}
+
+// Queue a background reload of the dictation pipeline (after a temp-model job
+// freed it) so the next dictation doesn't pay the load. Failures are logged
+// and retried lazily by the next transcribe.
+function scheduleDictationReload() {
+  enqueue(() => ensureDictationPipeline()).catch((e) => {
+    logErr('Dictation model reload failed (will retry on next dictation):', errMsg(e))
+  })
+}
+
 // ── File decoding (ffmpeg) ──────────────────────────────────────────────────────
 
 // ffmpeg-static returns a path inside app.asar when packaged; the binary itself
@@ -436,24 +454,37 @@ async function handleLoadModel({ id, model }) {
 }
 
 // Warm the on-disk cache for a file model (no file loaded yet); the pipeline
-// is disposed right after.
+// is disposed right after. The dictation model is freed for the duration and
+// reloaded afterwards - two multi-GB ONNX sessions in one process is exactly
+// the memory regime in which onnxruntime dies natively (see below).
 async function handlePreloadModel({ id, model }) {
-  /** @type {any} */ let pipe = null
   try {
-    pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+    await enqueue(async () => {
+      const old = whisperPipeline
+      whisperPipeline = null
+      await disposePipeline(old)
+      /** @type {any} */ let pipe = null
+      try {
+        pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+      } finally {
+        await disposePipeline(pipe)
+      }
+    })
     ok(id, {})
   } catch (err) {
     logErr('File model preload error:', errMsg(err))
     fail(id, err)
   } finally {
-    await disposePipeline(pipe)
+    scheduleDictationReload()
   }
 }
 
-// Dictation transcription on the warm pipeline (queued).
+// Dictation transcription on the warm pipeline (queued). Rebuilds the pipeline
+// first if a file job freed it and the background reload didn't run yet.
 async function handleTranscribe({ id, pcm, language, maxNewTokens }) {
   try {
-    const text = await enqueue(() => {
+    const text = await enqueue(async () => {
+      await ensureDictationPipeline()
       if (!whisperPipeline) throw new Error('No model loaded')
       const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm)
       return transcribe(whisperPipeline, samples, { language, maxNewTokens })
@@ -484,26 +515,42 @@ async function handleTranscribeFile({ id, filePath, model, language }) {
     const opts = { language, maxNewTokens: 444, onProgress, stopper: job.stopper }
 
     let text
+    let usedTempModel = false
     if (model === loadedModel && whisperPipeline) {
       text = await enqueue(() => {
         if (job.cancelled) throw cancelledError() // cancelled while queued
         return transcribe(whisperPipeline, pcm, opts)
       })
     } else {
-      /** @type {any} */ let tempPipe = null
-      try {
-        tempPipe = await buildWhisperPipeline(model, makeProgressCallback(model))
-        if (job.cancelled) throw cancelledError() // cancelled during download
-        post({ type: 'model-progress', model, data: { status: 'ready' } })
-        text = await transcribe(tempPipe, pcm, opts)
-      } finally {
-        await disposePipeline(tempPipe)
-      }
+      usedTempModel = true
+      text = await enqueue(async () => {
+        if (job.cancelled) throw cancelledError() // cancelled while queued
+        // Free the dictation model for the duration of the file job. Two
+        // multi-GB ONNX sessions plus inference activations in one process is
+        // the regime in which onnxruntime dies natively (reproduced: resident
+        // medium fp32/CoreML + large q8 inference killed the worker at ~11 GB
+        // RSS on a 64 GB machine, while the same job with the dictation model
+        // freed survived). The dictation pipeline is reloaded right after.
+        const old = whisperPipeline
+        whisperPipeline = null
+        await disposePipeline(old)
+        /** @type {any} */ let tempPipe = null
+        try {
+          tempPipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+          if (job.cancelled) throw cancelledError() // cancelled during download
+          post({ type: 'model-progress', model, data: { status: 'ready' } })
+          return await transcribe(tempPipe, pcm, opts)
+        } finally {
+          await disposePipeline(tempPipe)
+        }
+      })
     }
     ok(id, { text })
+    if (usedTempModel) scheduleDictationReload()
   } catch (err) {
     if (!(/** @type {any} */ (err)?.cancelled)) logErr('File transcription error:', errMsg(err))
     fail(id, err)
+    scheduleDictationReload() // no-op if the pipeline is still loaded
   } finally {
     if (activeFileJob === job) activeFileJob = null
   }
