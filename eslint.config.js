@@ -12,8 +12,8 @@ const nodeGlobals = {
 
 const browserGlobals = {
   window: 'readonly', document: 'readonly', navigator: 'readonly', console: 'readonly',
-  AudioContext: 'readonly', OfflineAudioContext: 'readonly', MediaRecorder: 'readonly',
-  Blob: 'readonly', Uint8Array: 'readonly', performance: 'readonly',
+  AudioContext: 'readonly', OfflineAudioContext: 'readonly', AudioBuffer: 'readonly',
+  Float32Array: 'readonly', performance: 'readonly',
   requestAnimationFrame: 'readonly', cancelAnimationFrame: 'readonly',
   setTimeout: 'readonly', clearTimeout: 'readonly', setInterval: 'readonly',
   clearInterval: 'readonly',

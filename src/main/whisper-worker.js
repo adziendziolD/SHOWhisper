@@ -12,7 +12,7 @@
 //   in : { type: 'init', cacheDir, llmCacheDir, isDev }
 //        { type: 'load-model',      id, model }
 //        { type: 'preload-model',   id, model }
-//        { type: 'transcribe',      id, pcm, language, maxNewTokens }
+//        { type: 'transcribe',      id, pcm, language, maxNewTokens, applyMarkers? }
 //        { type: 'transcribe-file', id, filePath, model, language }
 //        { type: 'cancel-file' }                 // cancels the active file job
 //        { type: 'summarize',       id, text, language, llmModelUri }
@@ -185,9 +185,9 @@ async function buildWhisperPipeline(modelName, progress_callback) {
 /**
  * @param {any} pipeline
  * @param {Float32Array} pcm
- * @param {{ language: string, maxNewTokens?: number, onProgress?: ((pct: number, chunk: number, totalChunks: number) => void) | null, stopper?: any }} opts
+ * @param {{ language: string, maxNewTokens?: number, onProgress?: ((pct: number, chunk: number, totalChunks: number) => void) | null, stopper?: any, applyMarkers?: boolean }} opts
  */
-async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgress = null, stopper = null }) {
+async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgress = null, stopper = null, applyMarkers = true }) {
   const durationSeconds = pcm.length / WHISPER_SAMPLE_RATE
   const genOptions = {
     language,
@@ -270,9 +270,12 @@ async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgr
     if (restoreGenerate) restoreGenerate()
   }
   log(`transcribe(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  const text = result.text.trim()
   // Rewrite spoken quote markers (e.g. "Zitat Anfang … Zitat Ende") into
-  // typographic quotes for the current language (see dictation.js).
-  return applyDictationMarkers(result.text.trim(), language)
+  // typographic quotes for the current language (see dictation.js). Live
+  // dictation chunks skip this (applyMarkers: false): a marker phrase can span
+  // a chunk boundary, so main applies it once to the full transcript.
+  return applyMarkers ? applyDictationMarkers(text, language) : text
 }
 
 async function disposePipeline(pipe) {
@@ -481,13 +484,13 @@ async function handlePreloadModel({ id, model }) {
 
 // Dictation transcription on the warm pipeline (queued). Rebuilds the pipeline
 // first if a file job freed it and the background reload didn't run yet.
-async function handleTranscribe({ id, pcm, language, maxNewTokens }) {
+async function handleTranscribe({ id, pcm, language, maxNewTokens, applyMarkers }) {
   try {
     const text = await enqueue(async () => {
       await ensureDictationPipeline()
       if (!whisperPipeline) throw new Error('No model loaded')
       const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm)
-      return transcribe(whisperPipeline, samples, { language, maxNewTokens })
+      return transcribe(whisperPipeline, samples, { language, maxNewTokens, applyMarkers: applyMarkers !== false })
     })
     ok(id, { text })
   } catch (err) {

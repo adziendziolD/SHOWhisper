@@ -21,7 +21,8 @@ interface WhisperBridge {
   onSummarizing(cb: () => void): void
   onDone(cb: () => void): void
   onModelLoading(cb: (data: ModelLoadingData) => void): void
-  sendAudio(pcm: Float32Array): void
+  sendChunk(id: number, pcm: Float32Array, final: boolean): void
+  onLiveText(cb: (text: string) => void): void
   recordingFailed(msg: string): void
   overlayReady(): void
   getLanguage(): Promise<Language>

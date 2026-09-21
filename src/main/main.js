@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPrefer
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
+const { applyDictationMarkers } = require('../shared/dictation')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -87,7 +88,7 @@ let loadingCount = 0           // >0 while a dictation-model load is in flight
 /** @type {Promise<boolean>} */
 let modelReadyPromise = Promise.resolve(false) // resolves true once the model is usable
 let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
-let dictationCount = 0         // >0 while an 'audio-ready' flow (transcribe/summarize/paste) runs
+let dictationCount = 0         // >0 while a live-dictation flow (transcribe/summarize/paste) runs
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
 let pendingSummarize = false   // set when recording was started via the summarize hotkey
 // Supported transcription languages (Whisper language names)
@@ -221,7 +222,8 @@ function createOverlay() {
     x: savedPos.x,
     y: savedPos.y,
     width: 350,
-    height: 72,
+    // 72 px pill + the live-transcript line shown while recording
+    height: 108,
     transparent: true,
     frame: false,
     alwaysOnTop: true,
@@ -253,6 +255,7 @@ function createOverlay() {
   overlayWindow.webContents.on('render-process-gone', (_e, details) => {
     logErr('Overlay renderer gone:', details.reason)
     overlayReady = false
+    abandonLiveSessions()
     isRecording = false
     pendingSummarize = false
     setTrayRecording(false)
@@ -752,36 +755,69 @@ ipcMain.on('cache-open', () => {
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
-ipcMain.on('audio-ready', async (_event, pcm) => {
-  log(`Audio received: ${pcm.length} samples`)
-  // Capture and reset the mode immediately - a new recording may start while
-  // this one is still transcribing/summarizing.
-  const summarizeMode = pendingSummarize
-  pendingSummarize = false
-  dictationCount++
-  overlayWindow?.webContents.send('transcribing')
+// Live dictation: while the user speaks, the renderer streams PCM chunks
+// (≈ FLUSH seconds each) plus one final chunk (possibly empty) at stop. Each
+// chunk is transcribed independently on the worker and appended to the
+// session text, which is mirrored to the overlay as it grows. Quote markers
+// are applied once at the end - a marker phrase can span a chunk boundary.
+// Chunks queue behind a still-running model load on the worker's chain, so no
+// extra waiting here (the overlay shows the load progress meanwhile).
+/** @type {Map<number, { text: string, summarizeMode: boolean }>} */
+const liveSessions = new Map()
+// Sessions whose recording died (mic unplugged, renderer crash): their chunks
+// may still be queued in the worker, but no 'final' chunk will ever arrive -
+// ignore them, otherwise dictationCount would stay >0 and the overlay could
+// never hide again.
+/** @type {Set<number>} */
+const deadDictationIds = new Set()
 
-  const language = /** @type {string} */ (store.get('language', 'german'))
-  let transcript = ''
-  try {
-    // Recording is allowed while the model still loads - so wait for the load
-    // before transcribing (the overlay shows the load progress meanwhile).
-    const modelOk = await modelReadyPromise
-    if (!modelOk && !loadedModel) throw new Error('No model loaded')
-    overlayWindow?.webContents.send('transcribing')
-    const res = await workerRequest('transcribe', { pcm, language, maxNewTokens: 440 })
-    transcript = res.text
-    // Only log the recognized text in dev mode (privacy for dictation).
-    log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
-  } catch (err) {
-    logErr('Transcription error:', errMsg(err))
+function abandonLiveSessions() {
+  for (const id of liveSessions.keys()) {
+    deadDictationIds.add(id)
+    dictationCount-- // the session's finalize (which decrements) will never run
   }
+  liveSessions.clear()
+}
+
+ipcMain.on('dictation-chunk', async (_event, { id, pcm, final }) => {
+  if (deadDictationIds.has(id)) return
+  let session = liveSessions.get(id)
+  if (!session) {
+    // Capture and reset the mode immediately - a new recording may start while
+    // this one is still transcribing/summarizing.
+    session = { text: '', summarizeMode: pendingSummarize }
+    pendingSummarize = false
+    liveSessions.set(id, session)
+    dictationCount++
+  }
+  const language = /** @type {string} */ (store.get('language', 'german'))
+
+  if (pcm.length > 0) {
+    try {
+      const res = await workerRequest('transcribe', { pcm, language, maxNewTokens: 440, applyMarkers: false })
+      session.text = session.text ? `${session.text} ${res.text}` : res.text
+      // Only log the recognized text in dev mode (privacy for dictation).
+      log(isDev ? `Live transcription: "${res.text}"` : `Live transcription done (${res.text.length} chars)`)
+    } catch (err) {
+      logErr('Live transcription error:', errMsg(err))
+    }
+    if (!final) overlayWindow?.webContents.send('live-text', session.text)
+  }
+
+  if (!final) return
+
+  // ── Finalize: markers → (summarize) → paste ──
+  liveSessions.delete(id)
+  deadDictationIds.delete(id)
+  const transcript = applyDictationMarkers(session.text.trim(), language)
+  log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
+  overlayWindow?.webContents.send('transcribing')
 
   // In summarize mode, run the transcript through the local LLM. On any failure
   // fall back to pasting the raw transcript (dictation must never be lost).
   let toPaste = transcript
   let summarized = false
-  if (summarizeMode && transcript) {
+  if (session.summarizeMode && transcript) {
     overlayWindow?.webContents.send('summarizing')
     try {
       const summary = await summarizeText(transcript, language)
@@ -834,6 +870,7 @@ ipcMain.on('audio-ready', async (_event, pcm) => {
 // otherwise the state stays stuck (the next ⌥Space would only resync).
 ipcMain.on('recording-failed', (_e, message) => {
   logErr('Recording failed (renderer):', message)
+  abandonLiveSessions()
   isRecording = false
   pendingSummarize = false
   setTrayRecording(false)
@@ -917,7 +954,7 @@ const HOTKEY_SUMMARIZE = 'Alt+Shift+Space'         // ⌥⇧Space: dictation + s
 // Unlike a global keyboard hook (uiohook/CGEventTap), this never sits in the
 // system-wide input delivery path, so it can't freeze keyboard/mouse input for
 // the whole machine. `summarizeMode` (from ⌥⇧Space) is captured at start and
-// makes 'audio-ready' summarize the transcript before pasting.
+// makes 'dictation-chunk' summarize the transcript before pasting.
 function toggleRecording(summarizeMode = false) {
   // globalShortcut can fire repeatedly while the combo is held (OS key auto-
   // repeat). Debounce so a brief hold doesn't rapidly flip start/stop.
@@ -949,7 +986,7 @@ function toggleRecording(summarizeMode = false) {
       return
     }
     // Recording itself doesn't need the model - transcription waits for the
-    // load in 'audio-ready'. But when there is no model and none is loading
+    // load in 'dictation-chunk'. But when there is no model and none is loading
     // (the load failed), transcription could never follow: retry the load
     // (with visible progress) instead of recording into the void.
     if (!loadedModel && loadingCount === 0) {
@@ -996,7 +1033,7 @@ function setupHotkey() {
   }
 }
 
-// nut-js simulates ⌘V/Ctrl+V to paste the transcript (see 'audio-ready'). On
+// nut-js simulates ⌘V/Ctrl+V to paste the transcript (see 'dictation-chunk'). On
 // macOS that needs Accessibility permission. globalShortcut itself does NOT, so
 // this is non-fatal: without it, recording/transcription still work and the text
 // stays on the clipboard for a manual paste - just the auto-paste is skipped.
