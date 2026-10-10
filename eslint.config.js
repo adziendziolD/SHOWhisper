@@ -27,7 +27,7 @@ const commonRules = {
 module.exports = [
   { ignores: ['dist/**', 'node_modules/**', 'assets/**'] },
   {
-    files: ['src/main/**/*.js', 'src/preload/**/*.js', 'src/shared/**/*.js'],
+    files: ['src/main/**/*.js', 'src/preload/**/*.js', 'src/shared/**/*.js', 'test/**/*.js'],
     languageOptions: { ecmaVersion: 2022, sourceType: 'commonjs', globals: nodeGlobals },
     rules: commonRules,
   },

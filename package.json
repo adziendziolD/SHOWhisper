@@ -28,7 +28,8 @@
     "dev": "NODE_ENV=development electron . --inspect=5858",
     "build": "electron-builder",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
