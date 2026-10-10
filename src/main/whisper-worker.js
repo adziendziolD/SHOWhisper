@@ -9,8 +9,10 @@
 //    detects the exit, resets state and respawns the worker.
 //
 // Protocol (structured-clone messages over process.parentPort):
-//   in : { type: 'init', cacheDir, llmCacheDir, isDev }
-//        { type: 'load-model',      id, model }
+//   in : { type: 'init', cacheDir, llmCacheDir, isDev, gpu }
+//        { type: 'config', gpu }                 // settings change, applies to the next load
+//        { type: 'smoke',           id }         // packaged-app self test (see main --smoke-test)
+//        { type: 'load-model',      id, model }  // -> { loadedModel, device }
 //        { type: 'preload-model',   id, model }
 //        { type: 'transcribe',      id, pcm, language, maxNewTokens, applyMarkers? }
 //        { type: 'transcribe-file', id, filePath, model, language }
@@ -47,14 +49,16 @@ function cancelledError() {
 
 // ── Config / state ──────────────────────────────────────────────────────────────
 
-/** @type {{ cacheDir: string, llmCacheDir: string, isDev: boolean }} */
-let cfg = { cacheDir: '', llmCacheDir: '', isDev: false }
+/** @type {{ cacheDir: string, llmCacheDir: string, isDev: boolean, gpu: boolean }} */
+let cfg = { cacheDir: '', llmCacheDir: '', isDev: false, gpu: true }
 
 const PROVIDER = 'Xenova'
 const WHISPER_SAMPLE_RATE = 16000
 
 /** @type {any} */ let whisperPipeline = null
 /** @type {string | null} */ let loadedModel = null
+/** Device the dictation pipeline runs on ('coreml' | 'dml' | 'cpu'), reported to main */
+let loadedDevice = 'cpu'
 
 // Serializes everything that touches the shared dictation pipeline: model
 // loads/swaps, dictation transcriptions and file transcriptions that reuse the
@@ -138,8 +142,10 @@ function makeProgressCallback(modelName) {
 }
 
 // Create (downloading if needed) a Whisper ASR pipeline for the given model,
-// with the CoreML->CPU device fallback. Throws on failure. Used both for the
-// active dictation model and for temporary per-file models.
+// on the GPU where possible (CoreML on macOS, DirectML on Windows) with a CPU
+// fallback. Throws on failure. Used both for the active dictation model and
+// for temporary per-file models. Returns the pipeline and the device it uses.
+/** @returns {Promise<{ pipe: any, device: string }>} */
 async function buildWhisperPipeline(modelName, progress_callback) {
   const { pipeline, env } = await import('@huggingface/transformers')
   env.cacheDir = cfg.cacheDir
@@ -168,18 +174,55 @@ async function buildWhisperPipeline(modelName, progress_callback) {
   //   CoreML EP cannot initialize ("model_path must not be empty") - every
   //   attempt deterministically mapped gigabytes and then failed (log-proven),
   //   so skip straight to the CPU/q8 path.
-  const useCoreml = process.platform === 'darwin' && modelName !== 'large'
+  // - DirectML (Windows): only the encoder runs on the GPU. It's the heavy
+  //   part (Whisper always encodes a full 30 s window, even for a 2 s chunk);
+  //   the autoregressive decoder is small, and DirectML handles its
+  //   past-key-value/If graph poorly - it stays on the CPU with q8. DirectML
+  //   doesn't support memory patterns or parallel execution, so both are
+  //   switched off explicitly. 'large' stays on the CPU (fp32 weights ~6 GB
+  //   of VRAM, more than most GPUs - especially integrated ones - have).
   const progress_cb = progress_callback || makeProgressCallback(modelName)
-  if (useCoreml) {
-    try {
-      return await pipeline('automatic-speech-recognition', modelId,
-        { device: 'coreml', dtype: 'fp32', session_options: { enableCpuMemArena: false }, progress_callback: progress_cb })
-    } catch (deviceErr) {
-      logErr(`Device 'coreml' failed, falling back to CPU:`, errMsg(deviceErr))
+  /** @type {{ device: string, options: Record<string, unknown> }[]} */
+  const attempts = []
+  if (cfg.gpu && modelName !== 'large') {
+    if (process.platform === 'darwin') {
+      attempts.push({ device: 'coreml', options: { device: 'coreml', dtype: 'fp32', session_options: { enableCpuMemArena: false } } })
+    } else if (process.platform === 'win32') {
+      attempts.push({ device: 'dml', options: {
+        device: { encoder_model: 'dml', decoder_model_merged: 'cpu' },
+        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' },
+        session_options: { enableCpuMemArena: false, enableMemPattern: false, executionMode: 'sequential' },
+      } })
     }
   }
-  return await pipeline('automatic-speech-recognition', modelId,
-    { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false }, progress_callback: progress_cb })
+  attempts.push({ device: 'cpu', options: { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false } } })
+
+  for (const [i, { device, options }] of attempts.entries()) {
+    const last = i === attempts.length - 1
+    /** @type {any} */ let pipe = null
+    try {
+      pipe = await pipeline('automatic-speech-recognition', modelId, { ...options, progress_callback: progress_cb })
+      // A GPU session can load fine and still fail on the first real run
+      // (driver/EP op support) - one tiny inference proves it works, and it
+      // also pays the one-time graph compilation now instead of on the
+      // user's first dictation.
+      if (device !== 'cpu') await warmUp(pipe)
+      log(`Whisper device: ${device}`)
+      return { pipe, device }
+    } catch (deviceErr) {
+      await disposePipeline(pipe)
+      if (last) throw deviceErr
+      logErr(`Device '${device}' failed, falling back to CPU:`, errMsg(deviceErr))
+    }
+  }
+  throw new Error('unreachable')
+}
+
+// One short inference on silence (result discarded).
+async function warmUp(pipe) {
+  const t0 = Date.now()
+  await pipe(new Float32Array(WHISPER_SAMPLE_RATE), { language: 'english', task: 'transcribe', max_new_tokens: 4 })
+  log(`Warm-up done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }
 
 /**
@@ -289,7 +332,9 @@ async function disposePipeline(pipe) {
 // model (see handleTranscribeFile/handlePreloadModel). Must run on the chain.
 async function ensureDictationPipeline() {
   if (whisperPipeline || !loadedModel) return
-  whisperPipeline = await buildWhisperPipeline(loadedModel, makeProgressCallback(loadedModel))
+  const built = await buildWhisperPipeline(loadedModel, makeProgressCallback(loadedModel))
+  whisperPipeline = built.pipe
+  loadedDevice = built.device
   log(`Dictation model reloaded: ${PROVIDER}/whisper-${loadedModel}`)
   post({ type: 'model-progress', model: loadedModel, data: { status: 'ready' } })
 }
@@ -439,17 +484,18 @@ function fail(id, err) {
 async function handleLoadModel({ id, model }) {
   try {
     await enqueue(async () => {
-      const pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+      const built = await buildWhisperPipeline(model, makeProgressCallback(model))
       const old = whisperPipeline
-      whisperPipeline = pipe
+      whisperPipeline = built.pipe
       loadedModel = model
+      loadedDevice = built.device
       log(`Model ready: ${PROVIDER}/whisper-${model}`)
       // Free the previous model's native memory - without this every model
       // switch stacks another multi-GB session (memory pressure was one source
       // of the allocator crashes).
       await disposePipeline(old)
     })
-    ok(id, { loadedModel })
+    ok(id, { loadedModel, device: loadedDevice })
   } catch (err) {
     logErr('Model load error:', errMsg(err))
     fail(id, err)
@@ -468,7 +514,7 @@ async function handlePreloadModel({ id, model }) {
       await disposePipeline(old)
       /** @type {any} */ let pipe = null
       try {
-        pipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+        pipe = (await buildWhisperPipeline(model, makeProgressCallback(model))).pipe
       } finally {
         await disposePipeline(pipe)
       }
@@ -539,7 +585,7 @@ async function handleTranscribeFile({ id, filePath, model, language }) {
         await disposePipeline(old)
         /** @type {any} */ let tempPipe = null
         try {
-          tempPipe = await buildWhisperPipeline(model, makeProgressCallback(model))
+          tempPipe = (await buildWhisperPipeline(model, makeProgressCallback(model))).pipe
           if (job.cancelled) throw cancelledError() // cancelled during download
           post({ type: 'model-progress', model, data: { status: 'ready' } })
           return await transcribe(tempPipe, pcm, opts)
@@ -577,13 +623,42 @@ async function handleSummarize({ id, text, language, llmModelUri }) {
   }
 }
 
+// Packaged-app self test: load every native dependency of the worker without
+// downloading any model. Catches the classic packaging failures (a *.node or
+// shared library missing from app.asar.unpacked, wrong-arch prebuilds).
+async function handleSmoke({ id }) {
+  try {
+    const ort = require('onnxruntime-node')
+    const backends = ort.listSupportedBackends().map((b) => b.name)
+    await import('@huggingface/transformers')
+    const ff = getFfmpegPath()
+    if (!ff || !fs.existsSync(ff)) throw new Error(`ffmpeg binary missing: ${ff}`)
+    const ffVersion = await new Promise((resolve, reject) => {
+      const p = spawn(ff, ['-version'])
+      let out = ''
+      p.stdout.on('data', (d) => { out += d.toString() })
+      p.on('error', reject)
+      p.on('close', (code) => (code === 0 ? resolve(out.split('\n')[0]) : reject(new Error(`ffmpeg -version exited ${code}`))))
+    })
+    // build: 'never' - a packaged app must ship a working prebuilt binary and
+    // never try to compile llama.cpp on the user's machine.
+    const { getLlama } = await import('node-llama-cpp')
+    const l = await getLlama({ build: 'never' })
+    ok(id, { backends, ffmpeg: ffVersion, llamaGpu: l.gpu })
+  } catch (err) {
+    fail(id, err)
+  }
+}
+
 parentPort.on('message', (e) => {
   const msg = e.data
   switch (msg?.type) {
     case 'init':
-      cfg = { cacheDir: msg.cacheDir, llmCacheDir: msg.llmCacheDir, isDev: !!msg.isDev }
-      log(`Whisper worker ready (pid ${process.pid})`)
+      cfg = { cacheDir: msg.cacheDir, llmCacheDir: msg.llmCacheDir, isDev: !!msg.isDev, gpu: msg.gpu !== false }
+      log(`Whisper worker ready (pid ${process.pid}, gpu=${cfg.gpu})`)
       break
+    case 'config':          cfg.gpu = msg.gpu !== false; break
+    case 'smoke':           handleSmoke(msg); break
     case 'load-model':      handleLoadModel(msg); break
     case 'preload-model':   handlePreloadModel(msg); break
     case 'transcribe':      handleTranscribe(msg); break

@@ -6,6 +6,9 @@ const { applyDictationMarkers } = require('../shared/dictation')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
+// `SHOWhisper --smoke-test`: CI check of the packaged app - load every native
+// module (in main and in the worker), print SMOKE OK and exit. See runSmokeTest.
+const isSmokeTest = process.argv.includes('--smoke-test')
 
 // Don't crash on EPIPE (e.g. when the terminal is closed)
 process.stdout.on('error', (e) => { if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EPIPE') throw e })
@@ -90,6 +93,7 @@ let modelReadyPromise = Promise.resolve(false) // resolves true once the model i
 let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
 let dictationCount = 0         // >0 while a live-dictation flow (transcribe/summarize/paste) runs
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
+let loadedDevice = 'cpu'       // device of the dictation model ('coreml' | 'dml' | 'cpu')
 // Supported transcription languages (Whisper language names)
 const LANGUAGES = ['german', 'english', 'french']
 // All models load from the public Xenova HuggingFace namespace, which hosts all
@@ -132,7 +136,7 @@ function spawnWorker() {
   worker.stderr?.on('data', (d) => { const s = d.toString().trimEnd(); if (s) elog.error('[worker]', s) })
   // postMessage is queued until the child has spawned, and ordering is
   // preserved - so init is always the first message the worker sees.
-  worker.postMessage({ type: 'init', cacheDir: MODEL_CACHE_DIR, llmCacheDir: LLM_CACHE_DIR, isDev })
+  worker.postMessage({ type: 'init', cacheDir: MODEL_CACHE_DIR, llmCacheDir: LLM_CACHE_DIR, isDev, gpu: gpuEnabled() })
   worker.on('message', handleWorkerMessage)
   worker.on('exit', handleWorkerExit)
 }
@@ -159,7 +163,24 @@ function handleWorkerMessage(msg) {
   }
 }
 
+// GPU inference (CoreML / DirectML) unless the user switched it off, or a
+// DirectML driver crashed the worker before (see handleWorkerExit).
+function gpuEnabled() {
+  if (!store) return true // smoke test: no store
+  return store.get('gpu', true) !== false && store.get('gpuAutoDisabled', false) !== true
+}
+
 function handleWorkerExit(code) {
+  // A GPU driver/EP crash takes the whole worker down natively - no exception
+  // reaches the CPU fallback in buildWhisperPipeline. If the worker died while
+  // the dictation model was on (or loading onto) DirectML, run on the CPU from
+  // now on; otherwise every respawn would crash again. Not for CoreML: it has
+  // been stable, and a crash there is far more likely unrelated.
+  if (!quitting && process.platform === 'win32' && gpuEnabled() && (loadedDevice === 'dml' || loadingCount > 0)) {
+    logErr('Worker crashed with DirectML active - disabling GPU inference')
+    store.set('gpuAutoDisabled', true)
+  }
+  loadedDevice = 'cpu'
   const requests = [...pendingRequests.values()]
   pendingRequests.clear()
   worker = null
@@ -310,6 +331,8 @@ function loadModel(modelName) {
     try {
       const res = await workerRequest('load-model', { model: modelName })
       loadedModel = res.loadedModel
+      loadedDevice = res.device || 'cpu'
+      log(`Dictation model ${loadedModel} on ${loadedDevice}`)
       store.set('model', modelName)
       updateTrayLabel(null)
       buildTrayMenu()
@@ -421,6 +444,14 @@ async function transcribeFileFlow(filePath) {
   if (fileJobRunning) {
     log('File transcription refused: another one is still running')
     sendFileStatus({ status: 'busy', message: tr('result.busy') })
+    return
+  }
+  // A file job holds the worker queue for minutes to hours - live chunks of a
+  // running dictation would wait behind it and get pasted much later into
+  // whatever has focus then. (The reverse case is handled in toggleRecording.)
+  if (isRecording || dictationCount > 0) {
+    log('File transcription refused: dictation in progress')
+    sendFileStatus({ status: 'busy', message: tr('result.dictationBusy') })
     return
   }
   fileJobRunning = true
@@ -840,8 +871,7 @@ async function finalizeDictation(id, session) {
 
   try {
     if (toPaste) {
-      // Save the old clipboard content
-      const prev = clipboard.readText()
+      const prev = snapshotClipboard()
       clipboard.writeText(toPaste)
 
       // Briefly let the window lose focus, then simulate paste (but keep the
@@ -861,7 +891,13 @@ async function finalizeDictation(id, session) {
 
       // After pasting the summary, leave the full transcript on the clipboard as a
       // fallback; for a plain dictation, restore the user's previous clipboard.
-      setTimeout(() => clipboard.writeText(summarized ? transcript : prev), 500)
+      // Only if it still holds our text: if the user copied something new in
+      // the meantime, that must win.
+      setTimeout(() => {
+        if (clipboard.readText() !== toPaste) return
+        if (summarized) clipboard.writeText(transcript)
+        else restoreClipboard(prev)
+      }, 600)
     }
   } catch (err) {
     // Auto-paste failed (e.g. Accessibility revoked after startup) - the text
@@ -874,6 +910,48 @@ async function finalizeDictation(id, session) {
     // Don't hide if the user has already started the next recording (or a
     // second dictation flow is still running).
     setTimeout(() => { if (!isRecording && dictationCount === 0) overlayWindow?.hide() }, 700)
+  }
+}
+
+// Snapshot every clipboard flavour Electron can write back - not just text:
+// an image or rich text the user copied before dictating must survive the
+// paste. Formats that clipboard.write() can't express (e.g. copied files) are
+// kept as one raw buffer of their first format.
+/**
+ * @typedef {{ text?: string, html?: string, rtf?: string, image?: import('electron').NativeImage,
+ *             raw?: { format: string, buffer: Buffer } } | null} ClipboardSnapshot
+ */
+/** @returns {ClipboardSnapshot} */
+function snapshotClipboard() {
+  try {
+    const formats = clipboard.availableFormats()
+    if (formats.length === 0) return null
+    /** @type {NonNullable<ClipboardSnapshot>} */
+    const snap = {}
+    const text = clipboard.readText()
+    if (text) snap.text = text
+    const html = clipboard.readHTML()
+    if (html) snap.html = html
+    const rtf = clipboard.readRTF()
+    if (rtf) snap.rtf = rtf
+    const image = clipboard.readImage()
+    if (!image.isEmpty()) snap.image = image
+    if (Object.keys(snap).length === 0) snap.raw = { format: formats[0], buffer: clipboard.readBuffer(formats[0]) }
+    return snap
+  } catch (err) {
+    logErr('Clipboard snapshot failed:', errMsg(err))
+    return null
+  }
+}
+
+/** @param {ClipboardSnapshot} snap */
+function restoreClipboard(snap) {
+  try {
+    if (!snap) clipboard.clear()
+    else if (snap.raw) clipboard.writeBuffer(snap.raw.format, snap.raw.buffer)
+    else clipboard.write(snap)
+  } catch (err) {
+    logErr('Clipboard restore failed:', errMsg(err))
   }
 }
 
@@ -1081,8 +1159,43 @@ function checkAccessibilityForPaste() {
 // ── App Lifecycle ─────────────────────────────────────────────────────────────
 
 app.commandLine.appendSwitch('disable-features', 'AutofillServerCommunication')
+// Wayland has no global key grabs; Electron routes globalShortcut through the
+// xdg-desktop-portal GlobalShortcuts API when this is on (no-op under X11).
+if (process.platform === 'linux') app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal')
+
+// One instance only: a second one (autostart + a manual launch) would add a
+// second tray icon and fail to register the hotkeys. Bring up the settings of
+// the running instance instead, so the click visibly did something.
+const gotInstanceLock = isSmokeTest || app.requestSingleInstanceLock()
+if (!gotInstanceLock) {
+  app.exit(0)
+} else {
+  app.on('second-instance', () => { if (store) openSettings() })
+}
+
+// Packaged-app self test (CI): every native module must load - in main
+// (nut-js) and in the worker (onnxruntime, transformers, ffmpeg, llama.cpp).
+// No model download, no windows, no user data touched. Exit code tells CI.
+async function runSmokeTest() {
+  const timer = setTimeout(() => { console.error('SMOKE FAIL: timeout'); app.exit(1) }, 60_000)
+  try {
+    require('@nut-tree-fork/nut-js')
+    spawnWorker()
+    const res = await workerRequest('smoke')
+    console.log(`SMOKE OK ${JSON.stringify(res)}`)
+    clearTimeout(timer)
+    quitting = true
+    worker?.kill()
+    app.exit(0)
+  } catch (err) {
+    console.error(`SMOKE FAIL: ${errMsg(err)}`)
+    app.exit(1)
+  }
+}
 
 app.whenReady().then(async () => {
+  if (!gotInstanceLock) return
+  if (isSmokeTest) { await runSmokeTest(); return }
   app.dock?.hide() // Mac: no dock icon
 
   const { default: Store } = await import('electron-store')
