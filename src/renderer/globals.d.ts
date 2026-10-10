@@ -37,3 +37,7 @@ interface Window {
   whisper: WhisperBridge
   i18n: I18nBridge
 }
+
+/** Pure audio helpers from src/shared/audio.js, loaded as a classic <script>
+ *  before overlay-renderer.js (sets globalThis.ShowAudio in the browser). */
+declare var ShowAudio: typeof import('../shared/audio.js')
