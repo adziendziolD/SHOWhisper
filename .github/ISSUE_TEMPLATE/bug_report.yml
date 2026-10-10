@@ -1,0 +1,117 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in as much as you can — the log file is usually the most helpful part.
+
+  - type: input
+    id: version
+    attributes:
+      label: SHOWhisper version
+      description: Shown in the release you downloaded (or `brew info --cask showhisper`).
+      placeholder: e.g. 0.7.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - Windows 11
+        - Windows 10
+        - Linux (X11)
+        - Linux (Wayland)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version / distribution
+      placeholder: e.g. macOS 15.4, Windows 11 24H2, Ubuntu 24.04 (GNOME, Wayland)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Homebrew
+        - Install script
+        - .dmg
+        - Windows installer (.exe)
+        - AppImage
+        - .deb
+        - Built from source
+    validations:
+      required: false
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Whisper model
+      options:
+        - tiny
+        - base
+        - small
+        - medium
+        - large
+        - not sure
+    validations:
+      required: false
+
+  - type: dropdown
+    id: feature
+    attributes:
+      label: Which feature is affected?
+      multiple: true
+      options:
+        - Dictation (hotkey / recording)
+        - Auto-paste
+        - Summaries (local LLM)
+        - File transcription
+        - Model download / cache
+        - Settings / tray menu
+        - Installation / update
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Press ⌥ Space
+        2. Say "…"
+        3. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: |
+        Please attach or paste the relevant part of the log. Production logs never contain your transcripts. Location:
+        - **macOS:** `~/Library/Logs/SHOWhisper/main.log`
+        - **Windows:** `%APPDATA%\SHOWhisper\logs\main.log`
+        - **Linux:** `~/.config/SHOWhisper/logs/main.log`
+      render: text
+    validations:
+      required: false

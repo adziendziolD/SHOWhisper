@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation where SHOWhisper falls short today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like it to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or other approaches you've thought about.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Relevant platforms
+      multiple: true
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - All
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        SHOWhisper is deliberately local and offline — ideas that keep everything on-device are the easiest to adopt.
