@@ -85,6 +85,17 @@ const translations = {
     'result.chunk': 'Abschnitt {done}/{total}',
     'result.unsupported': 'Dieses Dateiformat wird nicht unterstützt.',
     'result.mediaFilter': 'Mediendateien',
+
+    'update.later': 'Später',
+    'update.ready.title': 'Update bereit',
+    'update.ready.message': 'SHOWhisper {version} wurde heruntergeladen.',
+    'update.ready.detail': 'Jetzt neu starten, um das Update zu installieren – oder später: Es wird dann automatisch beim nächsten Beenden von SHOWhisper installiert.',
+    'update.ready.restart': 'Jetzt neu starten',
+    'update.available.title': 'Update verfügbar',
+    'update.available.message': 'SHOWhisper {version} ist verfügbar (installiert: {current}).',
+    'update.available.detail': 'Die neue Version kann auf der Release-Seite heruntergeladen werden.',
+    'update.available.detailMac': 'Die neue Version kann auf der Release-Seite heruntergeladen werden. Bei Installation über Homebrew stattdessen im Terminal ausführen:\nbrew upgrade --cask showhisper',
+    'update.available.download': 'Herunterladen',
   },
 
   english: {
@@ -165,6 +176,17 @@ const translations = {
     'result.chunk': 'Segment {done}/{total}',
     'result.unsupported': 'This file format is not supported.',
     'result.mediaFilter': 'Media files',
+
+    'update.later': 'Later',
+    'update.ready.title': 'Update ready',
+    'update.ready.message': 'SHOWhisper {version} has been downloaded.',
+    'update.ready.detail': 'Restart now to install the update – or later: it will then be installed automatically the next time you quit SHOWhisper.',
+    'update.ready.restart': 'Restart now',
+    'update.available.title': 'Update available',
+    'update.available.message': 'SHOWhisper {version} is available (installed: {current}).',
+    'update.available.detail': 'You can download the new version from the release page.',
+    'update.available.detailMac': 'You can download the new version from the release page. If you installed via Homebrew, run this in Terminal instead:\nbrew upgrade --cask showhisper',
+    'update.available.download': 'Download',
   },
 
   french: {
@@ -245,6 +267,17 @@ const translations = {
     'result.chunk': 'Segment {done}/{total}',
     'result.unsupported': 'Ce format de fichier n\'est pas pris en charge.',
     'result.mediaFilter': 'Fichiers média',
+
+    'update.later': 'Plus tard',
+    'update.ready.title': 'Mise à jour prête',
+    'update.ready.message': 'SHOWhisper {version} a été téléchargé.',
+    'update.ready.detail': 'Redémarrez maintenant pour installer la mise à jour – ou plus tard : elle sera alors installée automatiquement à la prochaine fermeture de SHOWhisper.',
+    'update.ready.restart': 'Redémarrer maintenant',
+    'update.available.title': 'Mise à jour disponible',
+    'update.available.message': 'SHOWhisper {version} est disponible (installé : {current}).',
+    'update.available.detail': 'Vous pouvez télécharger la nouvelle version depuis la page des versions.',
+    'update.available.detailMac': 'Vous pouvez télécharger la nouvelle version depuis la page des versions. Si vous l\'avez installé via Homebrew, exécutez plutôt dans le Terminal :\nbrew upgrade --cask showhisper',
+    'update.available.download': 'Télécharger',
   },
 }
 
