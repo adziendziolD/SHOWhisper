@@ -21,16 +21,19 @@ cask "showhisper" do
 
   # onnxruntime-node ships no Intel macOS build, so Apple Silicon only.
   depends_on arch: :arm64
-  depends_on macos: ">= :monterey"
+  depends_on macos: :monterey
 
   app "SHOWhisper.app"
 
   # The app is ad-hoc signed but not notarized (no paid Apple Developer
   # account). Homebrew quarantines cask downloads, which would make Gatekeeper
   # block the first launch; clear the attribute so it opens normally.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/SHOWhisper.app"]
+  # must_succeed: false - xattr exits non-zero if the attribute isn't set
+  # (e.g. installed with quarantine disabled), which is fine.
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:         ["-dr", "com.apple.quarantine", "{{appdir}}/SHOWhisper.app"],
+        must_succeed: false
   end
 
   uninstall quit: "com.showhisper.app"
