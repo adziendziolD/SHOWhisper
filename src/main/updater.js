@@ -120,8 +120,12 @@ function setupAutoUpdate({ log, logErr, tr, isDev, store }) {
  * @param {StrategyOptions} opts
  */
 function setupElectronUpdater({ log, logErr, tr, isDismissed, dismiss }) {
-  // Required lazily so macOS / deb builds never load it.
-  const { autoUpdater } = require('electron-updater')
+  // Required lazily so macOS / deb builds never load it. The updater class is
+  // picked explicitly instead of using the `autoUpdater` singleton: that one
+  // reads resources/package-type, which the deb target writes into the shared
+  // linux-unpacked dir, so an AppImage could otherwise end up with DebUpdater.
+  const { NsisUpdater, AppImageUpdater } = require('electron-updater')
+  const autoUpdater = process.platform === 'win32' ? new NsisUpdater() : new AppImageUpdater()
   autoUpdater.logger = {
     info: (/** @type {unknown} */ m) => log('[updater]', m),
     warn: (/** @type {unknown} */ m) => log('[updater] warn:', m),
