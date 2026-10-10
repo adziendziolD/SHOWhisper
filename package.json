@@ -26,6 +26,9 @@
   "scripts": {
     "start": "electron .",
     "dev": "NODE_ENV=development electron . --inspect=5858",
+    "fetch-node": "node scripts/fetch-node.js",
+    "e2e": "bash scripts/e2e-mac.sh",
+    "prebuild": "node scripts/fetch-node.js",
     "build": "electron-builder",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

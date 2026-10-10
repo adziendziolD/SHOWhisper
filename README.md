@@ -76,13 +76,17 @@ Update checks are a single anonymous request to GitHub for the latest release �
 
 ## Features
 
-- 🎙️ **Global hotkey dictation** — press <kbd>⌥</kbd> <kbd>Space</kbd> to start, press again to stop. The transcript is pasted at your cursor.
-- 🧠 **On-device summaries** — press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> instead and the dictation is summarized by a local LLM before it's pasted (the full transcript stays on your clipboard). Runs fully offline via [node-llama-cpp](https://node-llama-cpp.withcat.ai/).
+- 🎙️ **Global hotkey dictation** — press <kbd>⌥</kbd> <kbd>Space</kbd> to start, press again to stop. You see the text appear *while you speak*; the finished transcript is pasted at your cursor about a second after you stop. Hotkeys are configurable.
+- 🌍 **25 languages + auto-detect** — German, English, French, Spanish, Italian, Dutch, Polish, Japanese, Chinese, … or let Whisper detect the language per dictation.
+- 🧠 **Local AI actions** — press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> instead and a local LLM turns the dictation into a **summary**, a **polished text**, an **e-mail**, **bullet points** or an **English translation** before it's pasted. Runs fully offline via [node-llama-cpp](https://node-llama-cpp.withcat.ai/).
+- ✍️ **Voice commands & your own vocabulary** — say "new line" / "neue Zeile" or "new paragraph", and teach it names and terms with a simple replacement list.
+- 🕘 **History** — the last dictations are one click away in the tray menu, so nothing is lost when the paste lands in the wrong window.
 - 📁 **File transcription** — pick or drag in a media file (mp4, mov, mp3, m4a, wav …) and get a transcript in a result window, with an optional summary and copy/save.
 - 🔒 **Fully local & private** — transcription runs on-device via [Whisper](https://github.com/openai/whisper) (ONNX / [transformers.js](https://github.com/huggingface/transformers.js)), and summaries via a local GGUF model. Nothing leaves your computer.
 - 🪟 **Floating pill overlay** — a small, always-on-top capsule shows a live waveform while recording, progress while transcribing, and a ✓ when done. Drag it anywhere; its position is remembered.
 - 🍎 **Menubar app** — lives in the tray/menubar, no dock clutter. Pick your model from the menu.
-- ⚡ **Apple Silicon acceleration** — uses CoreML on macOS where available, with an automatic CPU fallback.
+- ⚡ **Fast everywhere** — ~0.7 s per sentence with `small` on Apple Silicon; on Windows the Whisper encoder runs on the GPU (DirectML) with automatic CPU fallback.
+- 🧭 **Guided setup & self-updating** — a first-run assistant checks microphone/Accessibility permissions, downloads a model and lets you test the hotkey; updates install automatically on Windows/Linux AppImage and are announced on macOS.
 - 🧩 **Model choice** — from `tiny` (fast) to `large` (best quality), downloaded on demand and cached locally.
 - 💬 **Spoken quote markers** — say a marker phrase around direct speech and it becomes proper typographic quotes in your language (see below).
 
@@ -100,11 +104,33 @@ Example (German): saying *“Er sagte Zitat Anfang das ist unmöglich Zitat Ende
 
 Marker matching is case-insensitive and tolerates the commas Whisper tends to insert. It's always on and only changes text when you actually speak a marker.
 
-## Summarizing your dictation
+## Voice commands & custom vocabulary
 
-Press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> (instead of <kbd>⌥</kbd> <kbd>Space</kbd>) to dictate **and** summarize. The audio is transcribed, then condensed by a local LLM in the same language, and the **summary** is pasted at your cursor while the **full transcript** is left on your clipboard.
+Say a layout command and it becomes a line break (can be switched off in **Settings**):
 
-The summary runs fully offline. The first time you use it, a GGUF model is downloaded once (~2.5 GB) and cached under the app's user-data directory (`llm-cache`); after that it works with no network. The default model is [`Qwen3-4B-Instruct-2507`](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF) (a current, multilingual, non-thinking instruct model). To use a different model, set the store key `llmModelUri` to any node-llama-cpp `hf:owner/repo:quant` URI or a local `.gguf` path.
+| Language | Line break | Paragraph |
+|----------|------------|-----------|
+| German   | „neue Zeile“ | „neuer Absatz“ |
+| English  | “new line” | “new paragraph” |
+| French   | « nouvelle ligne », « à la ligne » | « nouveau paragraphe » |
+
+Whisper sometimes misspells names, products or jargon. In **Settings → Replacements** add one rule per line — `heard => correct`, e.g. `show whisper => SHOWhisper`. Rules match whole words, ignore case, and run last, after quotes and voice commands.
+
+## AI actions (summary, polish, e-mail, …)
+
+Press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> (instead of <kbd>⌥</kbd> <kbd>Space</kbd>) to dictate **and** let a local LLM process the text. What it does is chosen in **Settings → AI action**:
+
+| Action | Result |
+|--------|--------|
+| Summarize *(default)* | A few concise sentences in the language you spoke |
+| Polish | Grammar, punctuation and filler words fixed — wording kept |
+| E-mail | A ready-to-send e-mail with greeting and closing (placeholders instead of invented facts) |
+| Bullet points | One idea per line |
+| Translate to English | Natural English translation |
+
+The **result** is pasted at your cursor while the **full transcript** is left on your clipboard.
+
+The AI action runs fully offline. The first time you use it, a GGUF model is downloaded once (~2.5 GB) and cached under the app's user-data directory (`llm-cache`); after that it works with no network. The default model is [`Qwen3-4B-Instruct-2507`](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF) (a current, multilingual, non-thinking instruct model). To use a different model, set the store key `llmModelUri` to any node-llama-cpp `hf:owner/repo:quant` URI or a local `.gguf` path.
 
 > Summaries need noticeably more RAM than dictation (a 4B Q4 model uses roughly 2.5–3.5 GB). On a 16 GB machine, prefer a smaller Whisper model if you summarize a lot.
 
@@ -121,21 +147,29 @@ Both hotkeys are global (work in any app) and toggle: press once to start record
 | Hotkey | Action |
 |--------|--------|
 | <kbd>⌥</kbd> <kbd>Space</kbd> | **Dictate.** Transcribe your speech and paste it at the cursor. |
-| <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> | **Dictate + summarize.** Transcribe, summarize with the local LLM, paste the summary; the full transcript stays on the clipboard. |
+| <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> | **Dictate + AI action.** Transcribe, run the chosen AI action (summary by default), paste the result; the full transcript stays on the clipboard. |
 
-Not a hotkey, but handy: **drag the floating pill** to reposition it anywhere on screen — its position is remembered. Everything else (model choice, file transcription, settings, quit) is in the **tray/menubar menu**. Hotkeys are currently fixed and not yet configurable.
+Both combos can be changed in **Settings** (click the field, press the new combination); the AI hotkey can also be switched off. If a combo is taken by another app, SHOWhisper keeps the previous one and tells you.
+
+Not a hotkey, but handy: **drag the floating pill** to reposition it anywhere on screen — its position is remembered. Everything else (model choice, history, file transcription, settings, setup, diagnostics, quit) is in the **tray/menubar menu**.
 
 ## How it works
 
 ```
 ⌥Space ─► global shortcut (main process)
-               ├─ overlay pill: recording → transcribing → done
-               ├─ Web Audio (renderer): capture + resample to 16 kHz mono PCM
-               ├─ Whisper (transformers.js): PCM → text
+               ├─ overlay pill: recording (live text) → transcribing → done
+               ├─ Web Audio (renderer): capture, cut into chunks at speech pauses,
+               │                         resample to 16 kHz mono PCM
+               ├─ inference worker (separate Node.js process): Whisper via
+               │     transformers.js / onnxruntime — each chunk while you speak
+               ├─ post-processing: quotes → voice commands → your replacements
+               │     (→ local LLM for the AI hotkey)
                └─ clipboard + simulated ⌘V / Ctrl+V → paste into focused app
 ```
 
-The <kbd>⌥</kbd> <kbd>Space</kbd> toggle is registered through Electron's built-in `globalShortcut` (the OS hot-key API), so it never sits in the system-wide input path and can't stall keyboard or mouse input.
+The hotkeys are registered through Electron's built-in `globalShortcut` (the OS hot-key API), so they never sit in the system-wide input path and can't stall keyboard or mouse input.
+
+Inference runs in its own process under a bundled standalone Node.js runtime instead of inside Electron: Electron's allocator (PartitionAlloc) made the first transcription after a short idle stall for 20 s to over 2 minutes, while plain Node takes ~2 s every time. A crash in the native inference code only restarts that worker, never the app.
 
 ## Requirements
 
@@ -176,6 +210,7 @@ The `.dmg` is **ad-hoc signed but not notarized** (building a notarized release 
 git clone https://github.com/adziendziolD/SHOWhisper.git
 cd SHOWhisper
 npm install
+npm run fetch-node   # standalone Node runtime for the inference worker
 npm start
 ```
 
@@ -185,17 +220,19 @@ The first time you use a model it is downloaded (once) and cached under the app'
 
 Choose in the tray menu. Larger models are more accurate (especially for German) but need more RAM and are slower.
 
-| Model     | Size   | RAM     | Latency (M1) | Quality |
-|-----------|--------|---------|--------------|---------|
-| tiny      | 75 MB  | ~125 MB | ~0.5 s       | ⚠️      |
-| base      | 150 MB | ~250 MB | ~1 s         | ✅      |
-| small     | 450 MB | ~700 MB | ~2–3 s       | ✅✅    |
-| medium    | 1.5 GB | ~2.5 GB | ~6–8 s       | ✅✅✅  |
-| large     | 3 GB   | ~4.5 GB | ~15 s        | 🏆      |
+| Model     | Download | Per sentence¹ | Quality | Notes |
+|-----------|----------|---------------|---------|-------|
+| tiny      | 75 MB    | fastest       | ⚠️      | |
+| base      | 150 MB   | fast          | ✅      | |
+| small     | 450 MB   | ~0.7 s        | ✅✅    | default — good for most machines |
+| medium    | 1.5 GB   | ~2 s          | ✅✅✅  | needs ≥ 16 GB RAM |
+| large     | 3 GB     | slow          | 🏆      | best for file transcription |
+
+¹ Measured on Apple Silicon (CPU) for a ~4 s chunk; text appears while you speak, so you only wait for the last chunk after stopping.
 
 Default: `small`. Models are loaded from the public [`Xenova`](https://huggingface.co/Xenova) HuggingFace namespace, which hosts all five sizes and needs no access token. Pick the model in the tray menu.
 
-> **Language:** German, English and French are selectable in **Settings**, and the whole UI localizes to the chosen language.
+> **Languages:** 25 transcription languages plus automatic detection are selectable in **Settings**. The app UI itself is available in German, English and French.
 
 ## Building installers
 
@@ -203,7 +240,7 @@ Default: `small`. Models are loaded from the public [`Xenova`](https://huggingfa
 npm run build
 ```
 
-Output lands in `dist/`: `.dmg` on macOS, NSIS `.exe` on Windows, `.AppImage` + `.deb` on Linux. Build on the platform you're targeting — the native modules (onnxruntime-node, nut-js/libnut, node-llama-cpp, ffmpeg-static) are installed by `npm install` for the host OS/arch only. Native modules are unpacked from the asar archive automatically (see `electron-builder.yml`).
+Output lands in `dist/`: `.dmg` on macOS, NSIS `.exe` on Windows, `.AppImage` + `.deb` on Linux. Build on the platform you're targeting — the native modules (onnxruntime-node, nut-js/libnut, node-llama-cpp, ffmpeg-static) are installed by `npm install` for the host OS/arch only. `npm run build` first fetches the standalone Node.js runtime for the inference worker (`scripts/fetch-node.js`, pinned version, SHA-256 verified) into `build/node/`; it ships as `resources/node`.
 
 ```bash
 npm run build -- --mac --arm64   # macOS (Apple Silicon)
@@ -239,19 +276,24 @@ mac:
 ## Development
 
 ```bash
-npm run dev     # electron with NODE_ENV=development + devtools + verbose logs
-npm run lint    # eslint
-npm test        # unit tests (node:test)
+npm run fetch-node  # once: the worker's Node runtime (without it, dev falls back to a utilityProcess)
+npm run dev         # electron with NODE_ENV=development + devtools + verbose logs
+npm run lint        # eslint
+npm run typecheck   # tsc --noEmit (JSDoc-typed JS)
+npm test            # unit tests (node:test)
+npm run e2e         # macOS: end-to-end dictation test with synthesized speech
+                    # through a fake microphone (uses your cached models)
 ```
+
+`SHOWhisper --smoke-test` (packaged app) loads every native module and exits 0/1 — CI runs it on all three platforms. `--e2e-dictation=<file.wav>` plays a WAV through Chromium's fake microphone into the real dictation path and prints the transcript instead of pasting.
 
 Verbose per-token / PCM diagnostics and transcript logging are only emitted in development mode — production builds keep logs minimal and never log the recognized text.
 
 ## Roadmap
 
-- Transcription history
-- More languages / auto-detect
-- Custom hotkey
 - Linux arm64 builds
+- Neural voice-activity detection (Silero VAD) for chunking in noisy rooms
+- Push-to-talk (needs a key-up event; `globalShortcut` only reports key-down, and a global keyboard hook is deliberately avoided)
 
 ## Tech stack
 

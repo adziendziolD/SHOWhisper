@@ -1,5 +1,6 @@
-// Whisper/LLM worker — runs in an Electron utilityProcess (plain Node context),
-// forked from main.js. All heavy work lives here: model loading (ONNX session
+// Whisper/LLM worker — a separate process forked from main.js, normally under
+// the bundled standalone Node.js runtime (fallback: an Electron
+// utilityProcess; see spawnWorker() for why). All heavy work lives here: model loading (ONNX session
 // creation), mel-spectrogram + Whisper inference, ffmpeg decoding of media
 // files, and the node-llama-cpp summarization model. Keeping this out of the
 // main process serves two purposes:
@@ -8,7 +9,7 @@
 //  - a native crash (onnxruntime/llama.cpp) kills only this process; main
 //    detects the exit, resets state and respawns the worker.
 //
-// Protocol (structured-clone messages over process.parentPort):
+// Protocol (structured-clone messages over process.send / process.parentPort):
 //   in : { type: 'init', cacheDir, llmCacheDir, isDev, gpu }
 //        { type: 'config', gpu }                 // settings change, applies to the next load
 //        { type: 'smoke',           id }         // packaged-app self test (see main --smoke-test)
@@ -32,9 +33,16 @@ const { applyMarkersFor } = require('../shared/postprocess')
 const { buildSystemPrompt, cleanSummary } = require('../shared/summarize')
 const { TRANSCRIPTION_LANGUAGES, languageFromCode } = require('../shared/languages')
 
+// Two transports (see spawnWorker() in main.js): a child_process fork under
+// the bundled Node runtime talks over process.send; the utilityProcess
+// fallback over process.parentPort. Both use structured clone, so PCM
+// Float32Arrays arrive as Float32Arrays.
 const parentPort = /** @type {any} */ (process).parentPort
 
-function post(msg) { parentPort.postMessage(msg) }
+function post(msg) {
+  if (parentPort) parentPort.postMessage(msg)
+  else process.send?.(msg)
+}
 function log(...args) { console.log(...args) }
 function logErr(...args) { console.error(...args) }
 
@@ -153,7 +161,7 @@ function makeProgressCallback(modelName) {
 // fallback. Throws on failure. Used both for the active dictation model and
 // for temporary per-file models. Returns the pipeline and the device it uses.
 /** @returns {Promise<{ pipe: any, device: string }>} */
-async function buildWhisperPipeline(modelName, progress_callback) {
+async function buildWhisperPipeline(modelName, progress_callback, { warm = true } = {}) {
   const { pipeline, env } = await import('@huggingface/transformers')
   env.cacheDir = cfg.cacheDir
   const modelId = `${PROVIDER}/whisper-${modelName}`
@@ -188,6 +196,12 @@ async function buildWhisperPipeline(modelName, progress_callback) {
   //   doesn't support memory patterns or parallel execution, so both are
   //   switched off explicitly. 'large' stays on the CPU (fp32 weights ~6 GB
   //   of VRAM, more than most GPUs - especially integrated ones - have).
+  // - macOS default is the CPU, with fp32 (the same files the CoreML path
+  //   uses, so no re-download): measured on Apple Silicon, onnxruntime's CPU
+  //   kernels are exactly as fast as CoreML (small 0.6 s, medium 2.1 s per
+  //   sentence) - but CoreML compiled lazily on the first real dictation after
+  //   every app start (20-30 s, seen in user logs) and was the source of the
+  //   crashes above. CoreML stays available as an opt-in (settings: GPU).
   const progress_cb = progress_callback || makeProgressCallback(modelName)
   /** @type {{ device: string, options: Record<string, unknown> }[]} */
   const attempts = []
@@ -202,18 +216,21 @@ async function buildWhisperPipeline(modelName, progress_callback) {
       } })
     }
   }
-  attempts.push({ device: 'cpu', options: { device: 'cpu', dtype: 'q8', session_options: { enableCpuMemArena: false } } })
+  const cpuDtype = process.platform === 'darwin' && modelName !== 'large' ? 'fp32' : 'q8'
+  attempts.push({ device: 'cpu', options: { device: 'cpu', dtype: cpuDtype, session_options: { enableCpuMemArena: false } } })
 
   for (const [i, { device, options }] of attempts.entries()) {
     const last = i === attempts.length - 1
     /** @type {any} */ let pipe = null
     try {
       pipe = await pipeline('automatic-speech-recognition', modelId, { ...options, progress_callback: progress_cb })
-      // A GPU session can load fine and still fail on the first real run
-      // (driver/EP op support) - one tiny inference proves it works, and it
-      // also pays the one-time graph compilation now instead of on the
-      // user's first dictation.
-      if (device !== 'cpu') await warmUp(pipe)
+      // One inference right after loading: a GPU session can load fine and
+      // still fail on its first real run (driver/EP op support) - this proves
+      // it works before we commit to it. And on every device the first
+      // encoder run is far slower than the rest (measured in the worker:
+      // medium 24.5 s vs 1.5 s, small ~30 s on CoreML) - paid here, in the
+      // background at load, instead of by the user's first dictation.
+      if (warm) await warmUp(pipe)
       log(`Whisper device: ${device}`)
       return { pipe, device }
     } catch (deviceErr) {
@@ -225,10 +242,20 @@ async function buildWhisperPipeline(modelName, progress_callback) {
   throw new Error('unreachable')
 }
 
-// One short inference on silence (result discarded).
+// One short inference (result discarded). Not on silence: Whisper ends a
+// silent window after a single token, so the decoder's with-past-key-values
+// path - which CoreML compiles on first use, measured ~35 s for 'small' -
+// would still be cold and the user's first dictation would pay for it.
+// Deterministic noise makes the decoder run a dozen real steps.
 async function warmUp(pipe) {
   const t0 = Date.now()
-  await pipe(new Float32Array(WHISPER_SAMPLE_RATE), { language: 'english', task: 'transcribe', max_new_tokens: 4 })
+  const pcm = new Float32Array(2 * WHISPER_SAMPLE_RATE)
+  let seed = 1
+  for (let i = 0; i < pcm.length; i++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    pcm[i] = ((seed / 0x7fffffff) - 0.5) * 0.2
+  }
+  await pipe(pcm, { language: 'english', task: 'transcribe', max_new_tokens: 16 })
   log(`Warm-up done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }
 
@@ -579,7 +606,7 @@ async function handlePreloadModel({ id, model }) {
       await disposePipeline(old)
       /** @type {any} */ let pipe = null
       try {
-        pipe = (await buildWhisperPipeline(model, makeProgressCallback(model))).pipe
+        pipe = (await buildWhisperPipeline(model, makeProgressCallback(model), { warm: false })).pipe
       } finally {
         await disposePipeline(pipe)
       }
@@ -716,8 +743,7 @@ async function handleSmoke({ id }) {
   }
 }
 
-parentPort.on('message', (e) => {
-  const msg = e.data
+function onMessage(msg) {
   switch (msg?.type) {
     case 'init':
       cfg = { cacheDir: msg.cacheDir, llmCacheDir: msg.llmCacheDir, isDev: !!msg.isDev, gpu: msg.gpu !== false }
@@ -733,4 +759,28 @@ parentPort.on('message', (e) => {
     case 'summarize':       handleSummarize(msg); break
     default:                logErr('Unknown worker message:', JSON.stringify(msg))
   }
-})
+}
+
+// Inverse of main's encodeTypedArrays (JSON IPC under the Node runtime).
+function decodeTypedArrays(msg) {
+  if (!msg || typeof msg !== 'object') return msg
+  for (const [k, v] of Object.entries(msg)) {
+    if (v && typeof v === 'object' && typeof v.__f32 === 'string') {
+      // Copy, don't view: small Buffers come from a shared pool at offsets
+      // that aren't 4-byte aligned (Float32Array views would throw).
+      const buf = Buffer.from(v.__f32, 'base64')
+      const f32 = new Float32Array(Math.floor(buf.byteLength / 4))
+      new Uint8Array(f32.buffer).set(buf.subarray(0, f32.byteLength))
+      msg[k] = f32
+    }
+  }
+  return msg
+}
+
+if (parentPort) {
+  parentPort.on('message', (e) => onMessage(e.data))
+} else {
+  process.on('message', (msg) => onMessage(decodeTypedArrays(msg)))
+  // Main gone (crash/kill): don't linger as an orphan holding GBs of model.
+  process.on('disconnect', () => process.exit(0))
+}

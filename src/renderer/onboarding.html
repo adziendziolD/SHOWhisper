@@ -13,6 +13,7 @@
       padding: 22px 24px;
       font-size: 13px;
       line-height: 1.5;
+      overflow-y: auto;
     }
 
     header {
@@ -223,11 +224,16 @@
       }
       $('btn-model').disabled = loadingModel || s.loading
 
+      // The text may name the hotkey several times - a <kbd> for each.
       $('test-text').innerHTML = ''
-      const hk = document.createElement('kbd')
-      hk.textContent = s.settings.hotkeyDictateLabel
-      const [before, after] = T('onb.test.text').split('{hotkey}')
-      $('test-text').append(before || '', hk, after || '')
+      T('onb.test.text').split('{hotkey}').forEach((part, i) => {
+        if (i > 0) {
+          const hk = document.createElement('kbd')
+          hk.textContent = s.settings.hotkeyDictateLabel
+          $('test-text').append(hk)
+        }
+        $('test-text').append(part)
+      })
       $('test-area').placeholder = ready ? T('onb.test.placeholder') : T('onb.test.waitModel')
     }
 

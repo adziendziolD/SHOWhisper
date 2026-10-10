@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, globalShortcut, utilityProcess } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPreferences, dialog, shell, globalShortcut, utilityProcess, powerSaveBlocker } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
@@ -16,6 +16,8 @@ const isSmokeTest = process.argv.includes('--smoke-test')
 // with Chromium's fake microphone playing the WAV. Prints the transcript
 // instead of pasting and exits. Model: env SHOWHISPER_E2E_MODEL (default tiny).
 const e2eAudio = process.argv.find((a) => a.startsWith('--e2e-dictation='))?.slice('--e2e-dictation='.length) || null
+// Separate profile for manual testing (fresh first-run setup etc.).
+if (process.env.SHOWHISPER_USER_DATA) app.setPath('userData', process.env.SHOWHISPER_USER_DATA)
 if (e2eAudio) {
   app.commandLine.appendSwitch('use-fake-device-for-media-stream')
   app.commandLine.appendSwitch('use-fake-ui-for-media-stream')
@@ -140,6 +142,8 @@ const DEFAULT_LLM_URI = 'hf:unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M'
 const MODEL_CACHE_DIR = path.join(app.getPath('userData'), 'model-cache')
 // Separate cache for the (optional, large) summarization GGUF.
 const LLM_CACHE_DIR = path.join(app.getPath('userData'), 'llm-cache')
+// Scratch space of the inference worker (see spawnWorker).
+const WORKER_TMP_DIR = path.join(app.getPath('userData'), 'worker-tmp')
 
 // ── Inference worker (utilityProcess) ───────────────────────────────────────────
 // All heavy lifting (Whisper, ffmpeg decode, LLM) runs in whisper-worker.js so
@@ -147,7 +151,12 @@ const LLM_CACHE_DIR = path.join(app.getPath('userData'), 'llm-cache')
 // never blocks, and a native crash (onnxruntime/llama.cpp) doesn't take the
 // whole app down: we detect the exit, reset state and respawn.
 
-/** @type {import('electron').UtilityProcess | null} */
+/**
+ * The worker process: a child_process under the bundled Node runtime, or an
+ * Electron utilityProcess as fallback. Both have stdout/stderr, 'message',
+ * 'exit' and kill(); sending differs (send vs postMessage) - see sendToWorker.
+ * @type {any}
+ */
 let worker = null
 let workerReqId = 0
 /** @type {Map<number, { resolve: (v: any) => void, reject: (e: any) => void, onProgress?: (p: any) => void }>} */
@@ -156,19 +165,102 @@ let quitting = false
 /** @type {number[]} */
 let workerRestarts = []        // timestamps, to detect a crash loop
 
+// Why a separate Node.js runtime and not Electron's utilityProcess: Electron
+// replaces malloc process-wide with Chromium's PartitionAlloc. onnxruntime
+// (with its own arena off - the arena aborts under PartitionAlloc, the old
+// "posix_memalign crash") then allocates every tensor through it, and after a
+// few idle seconds the first inference stalls in madvise for 20 s to over
+// 2 minutes (measured: medium encoder 24-215 s instead of 1.5-2 s; one thread
+// at 100 % in madvise, the compute threads waiting). Under plain Node with the
+// system allocator the same call takes 2 s every time. The worker's native
+// modules are all N-API, so they run unchanged under either runtime.
+function workerNodeRuntime() {
+  if (workerRuntimeBroken) return null
+  const bin = process.platform === 'win32' ? 'node.exe' : 'node'
+  const candidates = app.isPackaged
+    ? [path.join(process.resourcesPath, 'node', bin)]
+    : [process.env.SHOWHISPER_NODE, path.join(__dirname, '..', '..', 'build', 'node', bin)]
+  return candidates.find((p) => p && fs.existsSync(p)) || null
+}
+
 function spawnWorker() {
-  worker = utilityProcess.fork(path.join(__dirname, 'whisper-worker.js'), [], {
-    serviceName: 'SHOWhisper Inference',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  fs.mkdirSync(WORKER_TMP_DIR, { recursive: true })
+  const script = path.join(__dirname, 'whisper-worker.js')
+  // Own temp dir: onnxruntime's CoreML EP writes a converted copy of the
+  // model there per session and a killed worker never deletes it (~430 MB
+  // of orphans found in the system temp dir). Ours is emptied at startup.
+  /** @type {NodeJS.ProcessEnv} */
+  const env = { ...process.env, TMPDIR: WORKER_TMP_DIR }
+  delete env.ELECTRON_RUN_AS_NODE
+  const nodeBin = workerNodeRuntime()
+  if (nodeBin) {
+    const { fork } = require('child_process')
+    worker = fork(script, [], /** @type {import('child_process').ForkOptions} */ ({
+      execPath: nodeBin,
+      // JSON, not 'advanced': Electron's V8 writes a newer structured-clone
+      // format than the bundled Node can read. Typed arrays are base64'd
+      // explicitly (see sendToWorker / the worker's onMessage).
+      serialization: 'json',
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      env,
+      // node.exe is a console program - without this a console window would
+      // pop up next to the tray app on Windows (fork passes it on to spawn).
+      windowsHide: true,
+    }))
+    // Spawn failure (binary missing/blocked): fall back to utilityProcess on
+    // the next spawn instead of failing every request.
+    const child = worker
+    child.on('error', (err) => {
+      logErr('Worker runtime error:', errMsg(err))
+      // Never spawned (no pid): no 'exit' will follow - reject the pending
+      // requests and respawn via the fallback ourselves.
+      if (!child.pid) {
+        workerRuntimeBroken = true
+        if (worker === child) handleWorkerExit(-1)
+      }
+    })
+  } else {
+    if (app.isPackaged) logErr('Bundled Node runtime missing - running inference in a utilityProcess')
+    worker = utilityProcess.fork(script, [], {
+      serviceName: 'SHOWhisper Inference',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    })
+  }
+  log(`Worker started (${nodeBin ? `node ${nodeBin}` : 'utilityProcess'})`)
   // The worker logs via console; pipe its output into the main log file.
   worker.stdout?.on('data', (d) => { const s = d.toString().trimEnd(); if (s) elog.info('[worker]', s) })
   worker.stderr?.on('data', (d) => { const s = d.toString().trimEnd(); if (s) elog.error('[worker]', s) })
-  // postMessage is queued until the child has spawned, and ordering is
+  // Messages are queued until the child has spawned, and ordering is
   // preserved - so init is always the first message the worker sees.
-  worker.postMessage({ type: 'init', cacheDir: MODEL_CACHE_DIR, llmCacheDir: LLM_CACHE_DIR, isDev, gpu: gpuEnabled() })
-  worker.on('message', handleWorkerMessage)
-  worker.on('exit', handleWorkerExit)
+  sendToWorker({ type: 'init', cacheDir: MODEL_CACHE_DIR, llmCacheDir: LLM_CACHE_DIR, isDev, gpu: gpuEnabled() })
+  // Events of a worker that has already been replaced (e.g. spawn error +
+  // late exit) must not tear down its successor.
+  const w = worker
+  w.on('message', (msg) => { if (worker === w) handleWorkerMessage(msg) })
+  w.on('exit', (code) => { if (worker === w) handleWorkerExit(code) })
+}
+
+let workerRuntimeBroken = false
+
+// JSON IPC can't carry a Float32Array; send its bytes as base64 instead
+// (a live chunk is ~0.5 MB - encoding takes about a millisecond).
+function encodeTypedArrays(msg) {
+  const out = { ...msg }
+  for (const [k, v] of Object.entries(msg)) {
+    if (v instanceof Float32Array) out[k] = { __f32: Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString('base64') }
+  }
+  return out
+}
+
+function sendToWorker(msg) {
+  if (!worker) return
+  try {
+    if (typeof worker.postMessage === 'function') worker.postMessage(msg) // utilityProcess
+    else if (worker.connected) worker.send(encodeTypedArrays(msg))         // child_process
+  } catch (err) {
+    logErr('Worker send failed:', errMsg(err))
+  }
 }
 
 function handleWorkerMessage(msg) {
@@ -193,12 +285,34 @@ function handleWorkerMessage(msg) {
   }
 }
 
-// GPU inference (CoreML / DirectML) unless the user switched it off, or a
-// DirectML driver crashed the worker before (see handleWorkerExit).
-function gpuEnabled() {
-  if (!store) return true // smoke test: no store
-  return store.get('gpu', true) !== false && store.get('gpuAutoDisabled', false) !== true
+// GPU inference: DirectML on Windows by default; CoreML on macOS only when
+// switched on (the CPU is as fast there, see buildWhisperPipeline). Off after
+// a DirectML driver crashed the worker (see handleWorkerExit).
+const GPU_DEFAULT = process.platform === 'win32'
+function gpuSetting() {
+  return store ? store.get('gpu', GPU_DEFAULT) === true : GPU_DEFAULT
 }
+function gpuEnabled() {
+  return gpuSetting() && !(store && store.get('gpuAutoDisabled', false) === true)
+}
+
+// macOS App Nap: a tray app without dock icon or visible window gets napped
+// after a few idle seconds, and the inference worker with it - measured: the
+// first dictation chunk after a short idle took 25-140 s instead of 1.5-2 s
+// (encoder starved on throttled cores), every later chunk was fast again.
+// Block App Nap while there's work: recording, transcribing, file jobs,
+// model loads. Checked on every state change we drive plus a slow poll.
+let appNapBlocker = -1
+function updateAppNapBlocker() {
+  const busy = isRecording || dictationCount > 0 || fileJobRunning || loadingCount > 0
+  if (busy && appNapBlocker === -1) {
+    appNapBlocker = powerSaveBlocker.start('prevent-app-suspension')
+  } else if (!busy && appNapBlocker !== -1) {
+    powerSaveBlocker.stop(appNapBlocker)
+    appNapBlocker = -1
+  }
+}
+setInterval(updateAppNapBlocker, 2000)
 
 function handleWorkerExit(code) {
   // A GPU driver/EP crash takes the whole worker down natively - no exception
@@ -253,8 +367,7 @@ function workerRequest(type, payload = {}, { onProgress } = {}) {
   const id = ++workerReqId
   return new Promise((resolve, reject) => {
     pendingRequests.set(id, { resolve, reject, onProgress })
-    const w = /** @type {import('electron').UtilityProcess} */ (worker)
-    w.postMessage({ type, id, ...payload })
+    sendToWorker({ type, id, ...payload })
   })
 }
 
@@ -358,6 +471,7 @@ ipcMain.on('overlay-ready', () => {
  */
 function loadModel(modelName) {
   loadingCount++
+  updateAppNapBlocker()
   updateTrayLabel(tr('tray.loading', { model: modelName }))
   overlayWindow?.showInactive()
 
@@ -490,6 +604,7 @@ async function transcribeFileFlow(filePath) {
     return
   }
   fileJobRunning = true
+  updateAppNapBlocker()
   lastFilePath = filePath
   const model = getFileModel()
   sendFileStatus({ status: 'transcribing', name: path.basename(filePath), model, progress: 0 })
@@ -555,7 +670,7 @@ ipcMain.on('result-open-file', () => openFileForTranscription())
 // stopping criteria per token and aborts at the next opportunity (or kills a
 // still-running ffmpeg decode).
 ipcMain.on('result-cancel', () => {
-  if (fileJobRunning) worker?.postMessage({ type: 'cancel-file' })
+  if (fileJobRunning) sendToWorker({ type: 'cancel-file' })
 })
 
 // Model selector in the result window: expose the choices + current selection.
@@ -684,7 +799,7 @@ function openOnboarding() {
   if (onboardingWindow && !onboardingWindow.isDestroyed()) { onboardingWindow.focus(); return }
   onboardingWindow = new BrowserWindow({
     width: 520,
-    height: 680,
+    height: 770,
     resizable: false,
     show: false,
     title: 'SHOWhisper',
@@ -826,7 +941,7 @@ function settingsSnapshot() {
     hotkeyStatus: { ...hotkeyStatus },
     aiMode: getAiMode(),
     aiModes: AI_MODES,
-    gpu: store.get('gpu', true) !== false,
+    gpu: gpuSetting(),
     gpuAutoDisabled: store.get('gpuAutoDisabled', false) === true,
     device: loadedDevice,
     voiceCommands: store.get('voiceCommands', true) !== false,
@@ -861,7 +976,7 @@ function applySetting(key, value) {
       if (typeof value !== 'boolean') return 'invalid'
       store.set('gpu', value)
       if (value) store.delete('gpuAutoDisabled') // explicit opt-in: try again
-      worker?.postMessage({ type: 'config', gpu: gpuEnabled() })
+      sendToWorker({ type: 'config', gpu: gpuEnabled() })
       // Rebuild the dictation pipeline on the new device (queued behind any
       // running transcription on the worker).
       if (loadedModel) loadModel(loadedModel)
@@ -1139,6 +1254,7 @@ function abandonLiveSessions(id) {
 ipcMain.on('dictation-chunk', (_event, { id, pcm, final }) => {
   const session = liveSessions.get(id)
   if (!session || session.finalizing) return
+  if (e2eAudio) log(`E2E chunk: ${(pcm.length / 16000).toFixed(2)}s${final ? ' (final)' : ''}`)
 
   if (pcm.length > 0) {
     // Catch right here, not via `tail`: the request may fail while earlier
@@ -1502,6 +1618,7 @@ function toggleRecording(summarizeMode = false) {
     })
     dictationCount++
     isRecording = true
+    updateAppNapBlocker()
     setTrayRecording(true)
     overlayWindow?.showInactive()
     overlayWindow?.webContents.send('start-recording', id)
@@ -1551,7 +1668,9 @@ function checkAccessibilityForPaste() {
 
 // (The e2e run's fake microphone can't read its WAV from inside the sandboxed
 // out-of-process audio service - run that service in-process there.)
-app.commandLine.appendSwitch('disable-features', e2eAudio ? 'AutofillServerCommunication,AudioServiceOutOfProcess' : 'AutofillServerCommunication')
+const disabledFeatures = ['AutofillServerCommunication']
+if (e2eAudio) disabledFeatures.push('AudioServiceOutOfProcess')
+app.commandLine.appendSwitch('disable-features', disabledFeatures.join(','))
 // Wayland has no global key grabs; Electron routes globalShortcut through the
 // xdg-desktop-portal GlobalShortcuts API when this is on (no-op under X11).
 if (process.platform === 'linux') app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal')
@@ -1559,7 +1678,7 @@ if (process.platform === 'linux') app.commandLine.appendSwitch('enable-features'
 // One instance only: a second one (autostart + a manual launch) would add a
 // second tray icon and fail to register the hotkeys. Bring up the settings of
 // the running instance instead, so the click visibly did something.
-const gotInstanceLock = isSmokeTest || !!e2eAudio || app.requestSingleInstanceLock()
+const gotInstanceLock = isSmokeTest || !!e2eAudio || process.argv.some((a) => a.startsWith('--capture-ui=')) || app.requestSingleInstanceLock()
 if (!gotInstanceLock) {
   app.exit(0)
 } else {
@@ -1600,6 +1719,24 @@ function wavDurationSeconds(file) {
   throw new Error('no data chunk in WAV')
 }
 
+// `--capture-ui=<dir>`: render the setup and settings windows and save
+// screenshots of them (UI review without screen-recording permission).
+const captureUiDir = process.argv.find((a) => a.startsWith('--capture-ui='))?.slice('--capture-ui='.length) || null
+
+async function captureUi(dir) {
+  fs.mkdirSync(dir, { recursive: true })
+  openOnboarding()
+  openSettings()
+  await new Promise((r) => setTimeout(r, 3000))
+  for (const [name, win] of /** @type {const} */ ([['onboarding', onboardingWindow], ['settings', settingsWindow]])) {
+    if (!win || win.isDestroyed()) continue
+    const img = await win.webContents.capturePage()
+    fs.writeFileSync(path.join(dir, `${name}.png`), img.toPNG())
+    log(`Captured ${name}.png`)
+  }
+  app.exit(0)
+}
+
 async function runE2E() {
   const audio = /** @type {string} */ (e2eAudio)
   setTimeout(() => { console.error('E2E FAIL: timeout'); app.exit(1) }, 300_000)
@@ -1607,6 +1744,8 @@ async function runE2E() {
   createOverlay()
   spawnWorker()
   if (process.env.SHOWHISPER_E2E_LANGUAGE) store.set('language', process.env.SHOWHISPER_E2E_LANGUAGE)
+  if (process.env.SHOWHISPER_E2E_GPU) store.set('gpu', process.env.SHOWHISPER_E2E_GPU !== '0')
+  sendToWorker({ type: 'config', gpu: gpuEnabled() })
   const model = process.env.SHOWHISPER_E2E_MODEL || 'tiny'
   if (!(await loadModel(model))) { console.error('E2E FAIL: model load'); app.exit(1); return }
   while (!overlayReady) await new Promise((r) => setTimeout(r, 100))
@@ -1648,6 +1787,7 @@ app.whenReady().then(async () => {
   spawnWorker()
   setupHotkey()
   require('./updater').setupAutoUpdate({ log, logErr, tr, isDev, store })
+  if (captureUiDir) { await captureUi(captureUiDir); return }
   if (firstRun) {
     openOnboarding()
     return
@@ -1678,6 +1818,8 @@ function cleanupPartialDownloads() {
   }
   walk(MODEL_CACHE_DIR)
   if (freed > 0) log(`Removed partial downloads: ${Math.round(freed / 1e6)} MB`)
+  // Nothing in the worker's temp dir survives a restart (no worker yet).
+  try { fs.rmSync(WORKER_TMP_DIR, { recursive: true, force: true }) } catch { /* in use / gone */ }
 }
 
 // Electron types this listener as () => void; the running app does receive an
