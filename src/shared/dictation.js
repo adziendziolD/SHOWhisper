@@ -49,21 +49,31 @@ function phraseToSource(phrase) {
 }
 
 // Build (once per language) the combined matcher:
-//   (lead)(?:(openAlt)|(closeAlt))(trail)
-// lead/trail capture spaces and commas hugging the marker - but NOT . ? !, so
-// real sentence punctuation is preserved. Phrases are sorted longest-first so a
-// longer phrase can't be shadowed by a shorter prefix.
+//   (lead)(?:(openAlt)|(closeAlt))(trail)(?:(punct)(after))?
+// lead/trail capture spaces and commas hugging the marker. The marker must be a
+// whole word (no letter/digit directly before or after), so "quoted" or
+// "Zitat Anfangs" are left alone. One . : ; directly after the marker is
+// captured separately (punct): Whisper often ends a spoken marker with a period
+// ("Zitat Anfang. Das ..."), which is dropped after an opening marker and kept
+// after a closing one unless it would double the quote's own final . ? !.
+// ? and ! are never absorbed, so real sentence punctuation is preserved.
+// Phrases are sorted longest-first so a longer phrase can't be shadowed by a
+// shorter prefix.
 const regexCache = {}
 function getRegex(language) {
-  if (language in regexCache) return regexCache[language]
-  const markers = MARKERS[language]
+  if (Object.hasOwn(regexCache, language)) return regexCache[language]
+  const markers = Object.hasOwn(MARKERS, language) ? MARKERS[language] : null
   if (!markers) { regexCache[language] = null; return null }
 
   const byLengthDesc = (a, b) => b.length - a.length
   const openAlt  = [...markers.open].sort(byLengthDesc).map(phraseToSource).join('|')
   const closeAlt = [...markers.close].sort(byLengthDesc).map(phraseToSource).join('|')
 
-  const re = new RegExp(`([\\s,]*)(?:(${openAlt})|(${closeAlt}))([\\s,]*)`, 'giu')
+  const re = new RegExp(
+    `([\\s,]*)(?<![\\p{L}\\p{N}])(?:(${openAlt})|(${closeAlt}))(?![\\p{L}\\p{N}])` +
+    `([\\s,]*)(?:([.:;])(?![\\p{L}\\p{N}])([\\s,]*))?`,
+    'giu'
+  )
   regexCache[language] = re
   return re
 }
@@ -78,7 +88,8 @@ function getRegex(language) {
  */
 function applyDictationMarkers(text, language) {
   if (!text) return text
-  const quotes = QUOTES[language]
+  // hasOwn: inherited keys like 'constructor' are unknown languages, not hits.
+  const quotes = Object.hasOwn(QUOTES, language) ? QUOTES[language] : null
   const regex = getRegex(language)
   if (!quotes || !regex) return text
 
@@ -86,17 +97,22 @@ function applyDictationMarkers(text, language) {
     // lastIndex reset: the cached regex is global, so a prior partial run must
     // not leave a stale cursor. String.replace resets it, but be explicit.
     regex.lastIndex = 0
-    return text.replace(regex, (match, lead, openHit, _closeHit, trail, offset, whole) => {
+    return text.replace(regex, (match, lead, openHit, _closeHit, trail, punct, after, offset, whole) => {
       const atStart = offset === 0
       const atEnd = offset + match.length === whole.length
       if (openHit) {
         // Opening quote hugs the following word; restore a single leading space
-        // only if something separated it from the previous word.
+        // only if something separated it from the previous word. A period etc.
+        // right after the spoken marker is a Whisper artifact - dropped.
         return (lead && !atStart ? ' ' : '') + quotes.open
       }
       // Closing quote hugs the preceding word; restore a single trailing space
-      // only if the marker wasn't at the very end.
-      return quotes.close + (trail && !atEnd ? ' ' : '')
+      // only if the marker wasn't at the very end. Keep punctuation after the
+      // marker, except a period that would double the quote's own . ? ! / …
+      const before = offset > 0 ? whole[offset - 1] : ''
+      const keepPunct = punct && !(punct === '.' && /[.?!…]/u.test(before))
+      const spaced = (punct ? after : trail) && !atEnd
+      return quotes.close + (keepPunct ? punct : '') + (spaced ? ' ' : '')
     })
   } catch {
     // A post-processing bug must never lose a transcript.
