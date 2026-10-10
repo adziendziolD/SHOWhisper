@@ -15,7 +15,7 @@ interface ModelLoadingData {
 }
 
 interface WhisperBridge {
-  onStartRecording(cb: () => void): void
+  onStartRecording(cb: (id: number) => void): void
   onStopRecording(cb: () => void): void
   onTranscribing(cb: () => void): void
   onSummarizing(cb: () => void): void
@@ -23,7 +23,7 @@ interface WhisperBridge {
   onModelLoading(cb: (data: ModelLoadingData) => void): void
   sendChunk(id: number, pcm: Float32Array, final: boolean): void
   onLiveText(cb: (text: string) => void): void
-  recordingFailed(msg: string): void
+  recordingFailed(id: number, message: string): void
   overlayReady(): void
   getLanguage(): Promise<Language>
   onLanguageChanged(cb: (lang: Language) => void): void

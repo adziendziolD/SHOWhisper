@@ -8,26 +8,31 @@ const loadingBar  = /** @type {HTMLElement} */ (document.getElementById('loading
 const loadingPct  = /** @type {HTMLElement} */ (document.getElementById('loading-pct'))
 const liveTextEl  = /** @type {HTMLElement} */ (document.getElementById('live-text'))
 
-/** @type {MediaStream | null} */
-let mediaStream = null
-/** @type {ScriptProcessorNode | null} */
-let scriptNode  = null
-/** Raw PCM chunks at captureRate, waiting for the next flush */
-let pending     = /** @type {Float32Array[]} */ ([])
-let pendingLen  = 0
-let totalSamples = 0
-/** @type {number} */
-let recordingId  = 0
-/** @type {number} */
-let captureRate  = 0
-/** Serializes flushes so chunks reach the worker in recording order */
-let flushTail    = Promise.resolve()
+/**
+ * One recording. Everything lives on this object (not in module globals) so a
+ * stop that is still draining/flushing can never touch a recording the user
+ * already started right after it.
+ * @typedef {{
+ *   id: number,                        // assigned by main
+ *   stream: MediaStream | null,
+ *   ctx: AudioContext | null,
+ *   node: ScriptProcessorNode | null,
+ *   rate: number,                      // capture sample rate
+ *   pending: Float32Array[],           // raw PCM since the last flush
+ *   pendingLen: number,
+ *   total: number,
+ *   silentRun: number,                 // samples of silence at the end of `pending`
+ *   flushTail: Promise<void>,          // keeps chunks in recording order
+ *   stopped: boolean,
+ *   failed: boolean,
+ * }} Recording
+ */
+/** @type {Recording | null} */
+let rec = null
 /** @type {number | null} */
 let animFrameId   = null
 /** @type {AnalyserNode | null} */
 let analyser      = null
-/** @type {AudioContext | null} */
-let audioCtx      = null
 /** @type {ReturnType<typeof setInterval> | null} */
 let timerInterval = null
 let startTime     = 0
@@ -112,14 +117,20 @@ function stopTimer() {
 // ── Recording ─────────────────────────────────────────────────────────────────
 
 const WHISPER_SAMPLE_RATE = 16000
-// ponytail: fixed 4 s flush window, not sentence/silence detection - real
-// segmentation (e.g. webrtcvad) if mid-sentence chunk edges hurt quality.
-const FLUSH_SECONDS = 4
+// Chunks are cut at a speech pause once MIN_CHUNK_S of audio accumulated, at
+// the latest after MAX_CHUNK_S. Cutting in a pause instead of a fixed window
+// never splits a word, and the final chunk after stop stays short (fast).
+// Not much shorter: Whisper pads every call to a 30 s window, so each chunk
+// costs about the same - too many small ones would build a backlog.
+// ponytail: peak-floor pause detection, not a real VAD (e.g. webrtcvad).
+const MIN_CHUNK_S = 3
+const MAX_CHUNK_S = 8
+const PAUSE_MS = 350
 
-// Resample a mono PCM buffer at `captureRate` to 16 kHz (what Whisper
-// expects). Node can't decode audio, so this runs in the renderer.
-async function resampleTo16k(pcm) {
-  const buf = new AudioBuffer({ length: pcm.length, numberOfChannels: 1, sampleRate: captureRate })
+// Resample a mono PCM buffer to 16 kHz (what Whisper expects). Node can't
+// decode audio, so this runs in the renderer.
+async function resampleTo16k(pcm, rate) {
+  const buf = new AudioBuffer({ length: pcm.length, numberOfChannels: 1, sampleRate: rate })
   buf.copyToChannel(pcm, 0)
   const offline = new OfflineAudioContext(
     1,
@@ -135,12 +146,12 @@ async function resampleTo16k(pcm) {
 
 // ponytail: peak-floor trim + mean-absolute-value gate instead of a real VAD
 // - Whisper hallucinates full sentences on silent chunks ("Das war's für
-// heute."), so silence must never reach the model. Trimming the trailing
-// silence first also keeps a short utterance at the end of a mostly-silent
-// final buffer above the gate (and shortens every chunk).
+// heute."), so silence must never reach the model. Trimming leading and
+// trailing silence first keeps a short utterance in a mostly-silent chunk
+// above the gate (and shortens every chunk).
 const SILENCE_AVG_ABS = 0.003
 const TRIM_PEAK_FLOOR = 0.005   // per-sample peak that counts as "audible"
-const TRIM_KEEP_MS = 300        // keep a little tail after the last peak (decay)
+const TRIM_KEEP_MS = 300        // keep a little margin around speech (onset/decay)
 
 function isSilent(pcm) {
   let sum = 0
@@ -148,75 +159,107 @@ function isSilent(pcm) {
   return sum / pcm.length < SILENCE_AVG_ABS
 }
 
-// Cut everything after the last audible sample (+ TRIM_KEEP_MS). pcm is at
-// captureRate. Returns an empty array when nothing audible was found.
-function trimTrailingSilence(pcm) {
-  let last = -1
-  for (let i = pcm.length - 1; i >= 0; i--) {
+// Cut the silence before the first and after the last audible sample (keeping
+// TRIM_KEEP_MS on both sides). Returns an empty array when nothing is audible.
+function trimSilence(pcm, rate) {
+  let first = -1
+  for (let i = 0; i < pcm.length; i++) {
+    if (Math.abs(pcm[i]) > TRIM_PEAK_FLOOR) { first = i; break }
+  }
+  if (first === -1) return new Float32Array(0)
+  let last = first
+  for (let i = pcm.length - 1; i > first; i--) {
     if (Math.abs(pcm[i]) > TRIM_PEAK_FLOOR) { last = i; break }
   }
-  if (last === -1) return new Float32Array(0)
-  const end = Math.min(pcm.length, last + Math.round((TRIM_KEEP_MS / 1000) * captureRate) + 1)
-  return pcm.slice(0, end)
+  const keep = Math.round((TRIM_KEEP_MS / 1000) * rate)
+  return pcm.subarray(Math.max(0, first - keep), Math.min(pcm.length, last + keep + 1))
 }
 
-// Take a snapshot of the buffered audio, resample it and send it to main.
-// `final` chunks are always sent (even empty) - main finalizes the dictation
-// on that message, so it must arrive.
-async function doFlush(final) {
-  const chunks = pending
-  pending = []
-  pendingLen = 0
-  const len = chunks.reduce((n, c) => n + c.length, 0)
-  if (len === 0) {
-    if (final) window.whisper.sendChunk(recordingId, new Float32Array(0), true)
-    return
-  }
-  const pcm = new Float32Array(len)
+function concat(chunks) {
+  const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0))
   let off = 0
-  for (const c of chunks) { pcm.set(c, off); off += c.length }
-  const voiced = trimTrailingSilence(pcm)
-  if (voiced.length === 0 || isSilent(voiced)) {
-    if (final) window.whisper.sendChunk(recordingId, new Float32Array(0), true)
-    return
+  for (const c of chunks) { out.set(c, off); off += c.length }
+  return out
+}
+
+// Resample one snapshot and send it to main. Never throws: a broken chunk only
+// loses its own words, while the `final` message must always arrive (main
+// finalizes the dictation on it), so it's sent even when empty.
+async function flush(r, chunks, final) {
+  let out = new Float32Array(0)
+  try {
+    const voiced = trimSilence(concat(chunks), r.rate)
+    if (voiced.length > 0 && !isSilent(voiced)) out = await resampleTo16k(voiced, r.rate)
+  } catch (err) {
+    console.error('[overlay] Chunk flush failed:', err)
   }
-  window.whisper.sendChunk(recordingId, await resampleTo16k(voiced), final)
+  if (r.failed) return
+  if (out.length > 0 || final) window.whisper.sendChunk(r.id, out, final)
 }
 
-function queueFlush(final) {
-  const run = flushTail.then(() => doFlush(final))
-  flushTail = run.then(() => {}, () => {})
-  return run
+// Snapshot the buffered audio synchronously, then flush it in order.
+function queueFlush(r, final) {
+  const chunks = r.pending
+  r.pending = []
+  r.pendingLen = 0
+  r.silentRun = 0
+  r.flushTail = r.flushTail.then(() => flush(r, chunks, final))
 }
 
-// Tear everything down and report the failure to the main process, which
-// resets tray/toggle state and informs the user. Used by every error path so
-// the pill can never stay stuck in a recording/transcribing state.
-function failRecording(message) {
+// Release the mic and the audio graph of a recording.
+function teardown(r) {
+  if (r.node) {
+    r.node.onaudioprocess = null
+    try { r.node.disconnect() } catch { /* already disconnected */ }
+    r.node = null
+  }
+  if (r.stream) {
+    r.stream.getTracks().forEach((t) => {
+      t.onended = null
+      try { t.stop() } catch { /* already stopped */ }
+    })
+  }
+  // Close the AudioContext - browsers cap the number of open contexts (~6),
+  // otherwise new AudioContext() fails after a few recordings.
+  if (r.ctx) { r.ctx.close().catch(() => {}); r.ctx = null }
+}
+
+function resetRecordingUi() {
   stopTimer()
   if (animFrameId !== null) cancelAnimationFrame(animFrameId)
+  animFrameId = null
+  analyser = null
   ctx.clearRect(0, 0, canvas.width, canvas.height)
-  if (scriptNode) {
-    scriptNode.onaudioprocess = null
-    try { scriptNode.disconnect() } catch { /* already disconnected */ }
-    scriptNode = null
-  }
-  if (mediaStream) {
-    try { mediaStream.getTracks().forEach((t) => t.stop()) } catch { /* already stopped */ }
-    mediaStream = null
-  }
-  if (audioCtx) { audioCtx.close(); audioCtx = null }
-  pending = []
-  pendingLen = 0
-  setState('')
-  window.whisper.recordingFailed(message)
 }
 
-async function startRecording() {
-  pending = []
-  pendingLen = 0
-  totalSamples = 0
-  flushTail = Promise.resolve()
+// Tear the recording down and report the failure to the main process, which
+// drops its session, resets tray/toggle state and informs the user. Used by
+// every error path so the pill can never stay stuck in a recording state.
+function failRecording(r, message) {
+  if (r.failed) return
+  r.failed = true
+  r.stopped = true
+  teardown(r)
+  if (rec === r) rec = null
+  // Only reset the pill if no newer recording took it over meanwhile.
+  if (rec === null) {
+    resetRecordingUi()
+    setState('')
+  }
+  window.whisper.recordingFailed(r.id, message)
+}
+
+async function startRecording(id) {
+  // Main never starts twice without a stop, but if it did, don't leak the mic.
+  if (rec) stopRecording()
+
+  /** @type {Recording} */
+  const r = {
+    id, stream: null, ctx: null, node: null, rate: 0,
+    pending: [], pendingLen: 0, total: 0, silentRun: 0,
+    flushTail: Promise.resolve(), stopped: false, failed: false,
+  }
+  rec = r
   liveTextEl.textContent = ''
 
   // Microphone access can fail (permission denied, no device). Without a
@@ -228,44 +271,62 @@ async function startRecording() {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true })
   } catch (err) {
     console.error('[overlay] Microphone access failed:', err)
-    setState('')
-    window.whisper.recordingFailed(err instanceof Error ? err.message : String(err))
+    failRecording(r, err instanceof Error ? err.message : String(err))
     return
   }
-  mediaStream = stream
+  // Stopped while the permission prompt / device open was pending: stopRecording
+  // already sent the (empty) final chunk - just release the mic again.
+  if (r.stopped) {
+    stream.getTracks().forEach((t) => t.stop())
+    return
+  }
+  r.stream = stream
   // A track ending mid-recording (device unplugged, OS revoked access) would
   // otherwise leave the pill stuck and the main-process toggle desynced.
-  stream.getTracks().forEach((t) => { t.onended = () => failRecording('Microphone disconnected') })
+  stream.getTracks().forEach((t) => { t.onended = () => failRecording(r, 'Microphone disconnected') })
 
-  audioCtx = new AudioContext()
-  captureRate = audioCtx.sampleRate
-  const source = audioCtx.createMediaStreamSource(stream)
-  analyser = audioCtx.createAnalyser()
-  analyser.fftSize = 512
-  source.connect(analyser)
+  try {
+    r.ctx = new AudioContext()
+    r.rate = r.ctx.sampleRate
+    const source = r.ctx.createMediaStreamSource(stream)
+    analyser = r.ctx.createAnalyser()
+    analyser.fftSize = 512
+    source.connect(analyser)
 
-  // Raw PCM tap (no WebM/MediaRecorder): ScriptProcessor hands us 4096-sample
-  // buffers directly; once FLUSH_SECONDS of audio accumulated, it's resampled
-  // to 16 kHz and streamed to the worker for live transcription.
-  // ponytail: ScriptProcessor (deprecated) instead of an AudioWorklet - one
-  // fewer file, same throughput for a single mono mic stream.
-  scriptNode = audioCtx.createScriptProcessor(4096, 1, 1)
-  scriptNode.onaudioprocess = (e) => {
-    // Copy: the engine may overwrite the input buffer between callbacks,
-    // storing the view directly would alias every entry to the same memory.
-    const d = new Float32Array(e.inputBuffer.getChannelData(0))
-    pending.push(d)
-    pendingLen += d.length
-    totalSamples += d.length
-    if (pendingLen >= FLUSH_SECONDS * captureRate) queueFlush(false)
+    // Raw PCM tap (no WebM/MediaRecorder): ScriptProcessor hands us 4096-sample
+    // buffers directly; at the next speech pause (see MIN/MAX_CHUNK_S) the
+    // audio is resampled to 16 kHz and streamed to the worker.
+    // ponytail: ScriptProcessor (deprecated) instead of an AudioWorklet - one
+    // fewer file, same throughput for a single mono mic stream.
+    const node = r.ctx.createScriptProcessor(4096, 1, 1)
+    r.node = node
+    const pauseSamples = (PAUSE_MS / 1000) * r.rate
+    node.onaudioprocess = (e) => {
+      // Copy: the engine may overwrite the input buffer between callbacks,
+      // storing the view directly would alias every entry to the same memory.
+      const d = new Float32Array(e.inputBuffer.getChannelData(0))
+      r.pending.push(d)
+      r.pendingLen += d.length
+      r.total += d.length
+      let peak = 0
+      for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a }
+      r.silentRun = peak > TRIM_PEAK_FLOOR ? 0 : r.silentRun + d.length
+      if (r.pendingLen >= MAX_CHUNK_S * r.rate ||
+          (r.pendingLen >= MIN_CHUNK_S * r.rate && r.silentRun >= pauseSamples)) {
+        queueFlush(r, false)
+      }
+    }
+    const mute = r.ctx.createGain()
+    mute.gain.value = 0
+    source.connect(node)
+    node.connect(mute)
+    mute.connect(r.ctx.destination)
+  } catch (err) {
+    console.error('[overlay] Audio setup failed:', err)
+    failRecording(r, err instanceof Error ? err.message : String(err))
+    return
   }
-  const mute = audioCtx.createGain()
-  mute.gain.value = 0
-  source.connect(scriptNode)
-  scriptNode.connect(mute)
-  mute.connect(audioCtx.destination)
 
-  recordingId = Date.now()
   setState('recording')
   startTimer()
   drawWaveform()
@@ -277,43 +338,27 @@ async function startRecording() {
 const DRAIN_MS = 400
 
 async function stopRecording() {
-  if (!mediaStream) return
+  const r = rec
+  if (!r) return
+  // Detach right away: a recording started during the drain below gets its
+  // own state and is never touched by this stop.
+  rec = null
+  r.stopped = true
+  resetRecordingUi()
+  setState('transcribing')
 
-  stopTimer()
-  if (animFrameId !== null) cancelAnimationFrame(animFrameId)
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-  await new Promise((r) => setTimeout(r, DRAIN_MS))
-
-  // Stop capturing. The final flush only reads its PCM snapshot, so tearing
-  // the graph down now is safe.
-  if (scriptNode) {
-    scriptNode.onaudioprocess = null
-    try { scriptNode.disconnect() } catch { /* already disconnected */ }
-    scriptNode = null
+  if (r.stream) {
+    await new Promise((res) => setTimeout(res, DRAIN_MS))
+    if (r.failed) return
+    teardown(r)
+    if (r.total === 0) { failRecording(r, 'No audio data recorded'); return }
   }
-  try { mediaStream.getTracks().forEach((t) => t.stop()) } catch { /* already stopped */ }
-  mediaStream = null
-  // Close the AudioContext - browsers cap the number of open contexts (~6),
-  // otherwise new AudioContext() fails after a few recordings.
-  if (audioCtx) { audioCtx.close(); audioCtx = null }
-
-  if (totalSamples === 0) { failRecording('No audio data recorded'); return }
-
-  const finalize = queueFlush(true)
-  // A failed final flush means main never sees the 'final' chunk and would
-  // stay stuck in dictation state - report it like any other failure.
-  try {
-    await finalize
-  } catch (err) {
-    console.error('[overlay] Final flush failed:', err)
-    failRecording(err instanceof Error ? err.message : String(err))
-  }
+  queueFlush(r, true)
 }
 
 // ── IPC Events ────────────────────────────────────────────────────────────────
 
-window.whisper.onStartRecording(() => startRecording())
+window.whisper.onStartRecording((id) => startRecording(id))
 window.whisper.onStopRecording(()  => stopRecording())
 window.whisper.onTranscribing(()   => setState('transcribing'))
 window.whisper.onLiveText((text)   => {

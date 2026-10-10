@@ -90,7 +90,6 @@ let modelReadyPromise = Promise.resolve(false) // resolves true once the model i
 let isRecording = false        // hotkey toggle state (⌥Space starts/stops recording)
 let dictationCount = 0         // >0 while a live-dictation flow (transcribe/summarize/paste) runs
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
-let pendingSummarize = false   // set when recording was started via the summarize hotkey
 // Supported transcription languages (Whisper language names)
 const LANGUAGES = ['german', 'english', 'french']
 // All models load from the public Xenova HuggingFace namespace, which hosts all
@@ -257,7 +256,6 @@ function createOverlay() {
     overlayReady = false
     abandonLiveSessions()
     isRecording = false
-    pendingSummarize = false
     setTrayRecording(false)
     overlayWindow?.webContents.reload()
   })
@@ -755,70 +753,83 @@ ipcMain.on('cache-open', () => {
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
-// Live dictation: while the user speaks, the renderer streams PCM chunks
-// (≈ FLUSH seconds each) plus one final chunk (possibly empty) at stop. Each
-// chunk is transcribed independently on the worker and appended to the
-// session text, which is mirrored to the overlay as it grows. Quote markers
-// are applied once at the end - a marker phrase can span a chunk boundary.
-// Chunks queue behind a still-running model load on the worker's chain, so no
-// extra waiting here (the overlay shows the load progress meanwhile).
-/** @type {Map<number, { text: string, summarizeMode: boolean }>} */
+// Live dictation: while the user speaks, the renderer streams PCM chunks (cut
+// at speech pauses) plus one final chunk (possibly empty) at stop. Each chunk
+// is sent to the worker right away (its queue keeps them in order, and they
+// wait there behind a still-running model load - the overlay shows the load
+// progress meanwhile); results are appended strictly in recording order via
+// the session's `tail` promise, and the growing text is mirrored to the pill.
+// Quote markers are applied once at the end - a marker phrase can span a chunk
+// boundary. Sessions are created by toggleRecording (main owns the ids), so a
+// chunk for an unknown/abandoned id is simply ignored.
+/**
+ * @typedef {{ text: string, summarizeMode: boolean, language: string,
+ *             tail: Promise<void>, finalizing: boolean }} LiveSession
+ */
+/** @type {Map<number, LiveSession>} */
 const liveSessions = new Map()
-// Sessions whose recording died (mic unplugged, renderer crash): their chunks
-// may still be queued in the worker, but no 'final' chunk will ever arrive -
-// ignore them, otherwise dictationCount would stay >0 and the overlay could
-// never hide again.
-/** @type {Set<number>} */
-const deadDictationIds = new Set()
+let dictationSeq = 0
+let currentDictationId = 0     // the most recently started recording - only it drives the pill
 
-function abandonLiveSessions() {
-  for (const id of liveSessions.keys()) {
-    deadDictationIds.add(id)
-    dictationCount-- // the session's finalize (which decrements) will never run
-  }
-  liveSessions.clear()
+// Status messages for an older dictation that finishes while a newer one is
+// recording/transcribing must not flip the pill out of the newer one's state.
+function sendDictationStatus(id, channel, payload) {
+  if (id === currentDictationId) overlayWindow?.webContents.send(channel, payload)
 }
 
-ipcMain.on('dictation-chunk', async (_event, { id, pcm, final }) => {
-  if (deadDictationIds.has(id)) return
-  let session = liveSessions.get(id)
-  if (!session) {
-    // Capture and reset the mode immediately - a new recording may start while
-    // this one is still transcribing/summarizing.
-    session = { text: '', summarizeMode: pendingSummarize }
-    pendingSummarize = false
-    liveSessions.set(id, session)
-    dictationCount++
+// Drop recordings that died before their 'final' chunk (mic unplugged, renderer
+// crash): no finalize will ever run for them, so release their dictationCount
+// here - otherwise the overlay could never hide again. Sessions that already
+// got their final chunk are left alone: they finish (and decrement) normally.
+// Without an id, every not-yet-finalizing session is dropped.
+function abandonLiveSessions(id) {
+  for (const [sid, s] of liveSessions) {
+    if (s.finalizing || (id !== undefined && sid !== id)) continue
+    liveSessions.delete(sid)
+    dictationCount--
   }
-  const language = /** @type {string} */ (store.get('language', 'german'))
+}
+
+ipcMain.on('dictation-chunk', (_event, { id, pcm, final }) => {
+  const session = liveSessions.get(id)
+  if (!session || session.finalizing) return
 
   if (pcm.length > 0) {
-    try {
-      const res = await workerRequest('transcribe', { pcm, language, maxNewTokens: 440, applyMarkers: false })
+    // Catch right here, not via `tail`: the request may fail while earlier
+    // chunks are still pending (unhandled rejection otherwise). A lost chunk
+    // only loses its words - the dictation itself still finishes.
+    const req = workerRequest('transcribe', { pcm, language: session.language, maxNewTokens: 440, applyMarkers: false })
+      .catch((err) => { logErr('Live transcription error:', errMsg(err)); return { text: '' } })
+    session.tail = session.tail.then(() => req).then((res) => {
+      if (!res.text) return
       session.text = session.text ? `${session.text} ${res.text}` : res.text
       // Only log the recognized text in dev mode (privacy for dictation).
       log(isDev ? `Live transcription: "${res.text}"` : `Live transcription done (${res.text.length} chars)`)
-    } catch (err) {
-      logErr('Live transcription error:', errMsg(err))
-    }
-    if (!final) overlayWindow?.webContents.send('live-text', session.text)
+      if (isRecording) sendDictationStatus(id, 'live-text', session.text)
+    }).catch((err) => logErr('Live transcription error:', errMsg(err))) // never break the tail
   }
 
-  if (!final) return
+  if (final) {
+    session.finalizing = true
+    finalizeDictation(id, session)
+  }
+})
 
-  // ── Finalize: markers → (summarize) → paste ──
+// Wait for every outstanding chunk of the session, then markers → (summarize) → paste.
+async function finalizeDictation(id, session) {
+  sendDictationStatus(id, 'transcribing')
+  await session.tail
   liveSessions.delete(id)
-  deadDictationIds.delete(id)
+  const { language } = session
   const transcript = applyDictationMarkers(session.text.trim(), language)
   log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
-  overlayWindow?.webContents.send('transcribing')
 
   // In summarize mode, run the transcript through the local LLM. On any failure
   // fall back to pasting the raw transcript (dictation must never be lost).
   let toPaste = transcript
   let summarized = false
   if (session.summarizeMode && transcript) {
-    overlayWindow?.webContents.send('summarizing')
+    sendDictationStatus(id, 'summarizing')
     try {
       const summary = await summarizeText(transcript, language)
       if (summary) { toPaste = summary; summarized = true }
@@ -833,8 +844,9 @@ ipcMain.on('dictation-chunk', async (_event, { id, pcm, final }) => {
       const prev = clipboard.readText()
       clipboard.writeText(toPaste)
 
-      // Briefly let the window lose focus, then simulate paste
-      overlayWindow?.hide()
+      // Briefly let the window lose focus, then simulate paste (but keep the
+      // pill of a recording the user already started meanwhile)
+      if (!isRecording) overlayWindow?.hide()
       await new Promise(r => setTimeout(r, 80))
 
       const { keyboard, Key } = require('@nut-tree-fork/nut-js')
@@ -858,21 +870,23 @@ ipcMain.on('dictation-chunk', async (_event, { id, pcm, final }) => {
     logErr('Paste error:', errMsg(err))
   } finally {
     dictationCount--
-    overlayWindow?.webContents.send('done')
+    sendDictationStatus(id, 'done')
     // Don't hide if the user has already started the next recording (or a
     // second dictation flow is still running).
     setTimeout(() => { if (!isRecording && dictationCount === 0) overlayWindow?.hide() }, 700)
   }
-})
+}
 
 // Renderer reports that recording couldn't start (e.g. microphone permission
 // denied) or produced no usable audio. Reset overlay/tray and the toggle,
 // otherwise the state stays stuck (the next ⌥Space would only resync).
-ipcMain.on('recording-failed', (_e, message) => {
+ipcMain.on('recording-failed', (_e, { id, message }) => {
   logErr('Recording failed (renderer):', message)
-  abandonLiveSessions()
+  abandonLiveSessions(id)
+  // A late failure of an older recording (e.g. its stop produced no audio)
+  // while a newer one already runs must not reset the newer one's state.
+  if (id !== currentDictationId) return
   isRecording = false
-  pendingSummarize = false
   setTrayRecording(false)
   overlayWindow?.hide()
   if (!settingsWindow || settingsWindow.isDestroyed()) {
@@ -994,11 +1008,22 @@ function toggleRecording(summarizeMode = false) {
       loadModel(/** @type {string} */ (store.get('model', 'small')))
       return
     }
-    pendingSummarize = summarizeMode
+    // Main owns the dictation ids: mode and language are fixed per recording,
+    // and chunks/failures for an id that is no longer live are ignored.
+    const id = ++dictationSeq
+    currentDictationId = id
+    liveSessions.set(id, {
+      text: '',
+      summarizeMode,
+      language: /** @type {string} */ (store.get('language', 'german')),
+      tail: Promise.resolve(),
+      finalizing: false,
+    })
+    dictationCount++
     isRecording = true
     setTrayRecording(true)
     overlayWindow?.showInactive()
-    overlayWindow?.webContents.send('start-recording')
+    overlayWindow?.webContents.send('start-recording', id)
   } else {
     isRecording = false
     setTrayRecording(false)

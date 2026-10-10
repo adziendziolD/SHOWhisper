@@ -14,7 +14,7 @@ function t(lang, key, vars) {
 contextBridge.exposeInMainWorld('i18n', { t })
 
 contextBridge.exposeInMainWorld('whisper', {
-  onStartRecording: (cb) => ipcRenderer.on('start-recording', cb),
+  onStartRecording: (cb) => ipcRenderer.on('start-recording', (_e, id) => cb(id)),
   onStopRecording:  (cb) => ipcRenderer.on('stop-recording', cb),
   onTranscribing:   (cb) => ipcRenderer.on('transcribing', cb),
   onSummarizing:    (cb) => ipcRenderer.on('summarizing', cb),
@@ -22,7 +22,7 @@ contextBridge.exposeInMainWorld('whisper', {
   onModelLoading:   (cb) => ipcRenderer.on('model-loading', (_e, data) => cb(data)),
   sendChunk:        (id, pcm, final) => ipcRenderer.send('dictation-chunk', { id, pcm, final }),
   onLiveText:       (cb) => ipcRenderer.on('live-text', (_e, text) => cb(text)),
-  recordingFailed:  (msg) => ipcRenderer.send('recording-failed', msg),
+  recordingFailed:  (id, message) => ipcRenderer.send('recording-failed', { id, message }),
   overlayReady:     () => ipcRenderer.send('overlay-ready'),
   getLanguage:       () => ipcRenderer.invoke('get-language'),
   onLanguageChanged: (cb) => ipcRenderer.on('language-changed', (_e, lang) => cb(lang)),
