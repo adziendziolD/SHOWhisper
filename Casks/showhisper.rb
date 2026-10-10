@@ -3,13 +3,14 @@
 #   brew tap adziendziolD/showhisper https://github.com/adziendziolD/SHOWhisper
 #   brew install --cask showhisper
 #
-# version + sha256 are bumped automatically by the release job in
-# .github/workflows/build.yml after each tagged release.
+# version, sha256 and url are rewritten automatically by the release job in
+# .github/workflows/build.yml after each tagged release. (0.6.1 still uses the
+# old "-arm64.dmg" asset name; releases from then on are "-mac-arm64.dmg".)
 cask "showhisper" do
-  version "0.6.0"
-  sha256 :no_check
+  version "0.6.1"
+  sha256 "03a7a80bffb2b0c89b4c87e5ff931db17151c01a24bd812a42470c50787f74d1"
 
-  url "https://github.com/adziendziolD/SHOWhisper/releases/download/v#{version}/SHOWhisper-#{version}-mac-arm64.dmg"
+  url "https://github.com/adziendziolD/SHOWhisper/releases/download/v#{version}/SHOWhisper-#{version}-arm64.dmg"
   name "SHOWhisper"
   desc "Local, private Whisper dictation in the menu bar"
   homepage "https://github.com/adziendziolD/SHOWhisper"
