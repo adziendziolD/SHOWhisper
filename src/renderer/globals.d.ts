@@ -18,7 +18,7 @@ interface WhisperBridge {
   onStartRecording(cb: (id: number) => void): void
   onStopRecording(cb: () => void): void
   onTranscribing(cb: () => void): void
-  onSummarizing(cb: () => void): void
+  onSummarizing(cb: (mode: string) => void): void
   onDone(cb: () => void): void
   onModelLoading(cb: (data: ModelLoadingData) => void): void
   sendChunk(id: number, pcm: Float32Array, final: boolean): void

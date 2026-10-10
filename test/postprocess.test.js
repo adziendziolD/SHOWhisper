@@ -1,7 +1,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const {
-  applyVoiceCommands, applyReplacements, parseReplacements, formatReplacements,
+  postprocessDictation, applyMarkersFor, applyVoiceCommands, applyReplacements, parseReplacements, formatReplacements,
 } = require('../src/shared/postprocess')
 
 test('voice commands: German line and paragraph breaks', () => {
@@ -49,4 +49,19 @@ test('parse/format replacements round-trip', () => {
     { from: 'baz', to: '' },
   ])
   assert.deepEqual(parseReplacements(formatReplacements(list)), list)
+})
+
+test('markers: known language, auto tries all, other languages untouched', () => {
+  assert.equal(applyMarkersFor('Er sagte Zitat Anfang hallo Zitat Ende', 'german'), 'Er sagte „hallo“')
+  assert.equal(applyMarkersFor('He said open quote hi close quote', 'auto'), 'He said “hi”')
+  assert.equal(applyMarkersFor('Er sagte Zitat Anfang hallo Zitat Ende', null), 'Er sagte „hallo“')
+  assert.equal(applyMarkersFor('Dijo Zitat Anfang hola Zitat Ende', 'spanish'), 'Dijo Zitat Anfang hola Zitat Ende')
+})
+
+test('postprocessDictation: markers, commands, then replacements', () => {
+  const out = postprocessDictation('Zitat Anfang show whisper Zitat Ende neue Zeile fertig', {
+    language: 'german', replacements: [{ from: 'show whisper', to: 'SHOWhisper' }],
+  })
+  assert.equal(out, '„SHOWhisper“\nFertig')
+  assert.equal(postprocessDictation('a neue Zeile b', { language: 'german', voiceCommands: false }), 'a neue Zeile b')
 })

@@ -23,4 +23,8 @@ contextBridge.exposeInMainWorld('settings', {
   cacheClear:        ()               => ipcRenderer.invoke('cache-clear-all'),
   cacheOpen:         ()               => ipcRenderer.send('cache-open'),
   resize:            (height)         => ipcRenderer.send('settings-resize', height),
+  get:               ()               => ipcRenderer.invoke('settings-get'),
+  set:               (key, value)     => ipcRenderer.invoke('settings-set', key, value),
+  suspendHotkeys:    (suspend)        => ipcRenderer.send('hotkeys-suspend', suspend),
+  clearHistory:      ()               => ipcRenderer.send('history-clear'),
 })

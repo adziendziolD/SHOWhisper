@@ -14,10 +14,11 @@
 //        { type: 'smoke',           id }         // packaged-app self test (see main --smoke-test)
 //        { type: 'load-model',      id, model }  // -> { loadedModel, device }
 //        { type: 'preload-model',   id, model }
-//        { type: 'transcribe',      id, pcm, language, maxNewTokens, applyMarkers? }
-//        { type: 'transcribe-file', id, filePath, model, language }
+//        { type: 'transcribe',      id, pcm, language, maxNewTokens, applyMarkers?, sessionKey? }
+//                                                // -> { text, language }  (language: detected name with 'auto')
+//        { type: 'transcribe-file', id, filePath, model, language }   // -> { text, language }
 //        { type: 'cancel-file' }                 // cancels the active file job
-//        { type: 'summarize',       id, text, language, llmModelUri }
+//        { type: 'summarize',       id, text, language, llmModelUri, mode? }
 //   out: { type: 'result', id, ok, value?, error?, cancelled? }
 //        { type: 'progress', id, pct, chunk, totalChunks }   // file jobs
 //        { type: 'model-progress', model, data }             // download/load
@@ -27,8 +28,9 @@
 const path = require('path')
 const fs = require('fs')
 const { spawn } = require('child_process')
-const { applyDictationMarkers } = require('../shared/dictation')
+const { applyMarkersFor } = require('../shared/postprocess')
 const { buildSystemPrompt, cleanSummary } = require('../shared/summarize')
+const { TRANSCRIPTION_LANGUAGES, languageFromCode } = require('../shared/languages')
 
 const parentPort = /** @type {any} */ (process).parentPort
 
@@ -67,6 +69,11 @@ let loadedDevice = 'cpu'
 // safe strictly one after another. Temp-pipeline file jobs and the LLM run
 // outside this chain (independent sessions).
 let chain = Promise.resolve()
+/**
+ * @template T
+ * @param {() => T | Promise<T>} fn
+ * @returns {Promise<T>}
+ */
 function enqueue(fn) {
   const run = chain.then(fn, fn)
   chain = run.then(() => {}, () => {}) // keep the chain alive after a failure
@@ -225,15 +232,66 @@ async function warmUp(pipe) {
   log(`Warm-up done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }
 
+// ── Language detection ─────────────────────────────────────────────────────────
+// transformers.js has no Whisper language detection (with no language it
+// silently assumes English). Whisper itself predicts the language as the first
+// token after <|startoftranscript|>: one encoder + one decoder step, then the
+// most likely language token among the ones we offer.
+async function detectLanguage(pipe, pcm) {
+  const { Tensor } = await import('@huggingface/transformers')
+  const t0 = Date.now()
+  const gc = pipe.model.generation_config
+  const { input_features } = await pipe.processor(pcm.subarray(0, 30 * WHISPER_SAMPLE_RATE))
+  const sot = BigInt(gc.decoder_start_token_id)
+  const out = await pipe.model({ input_features, decoder_input_ids: new Tensor('int64', BigInt64Array.from([sot]), [1, 1]) })
+  const vocab = out.logits.dims.at(-1)
+  const logits = out.logits.data.subarray(out.logits.data.length - vocab)
+  let best = 'en'
+  let bestScore = -Infinity
+  for (const code of Object.values(TRANSCRIPTION_LANGUAGES)) {
+    const id = gc.lang_to_id?.[`<|${code}|>`]
+    if (id !== undefined && logits[id] > bestScore) { bestScore = logits[id]; best = code }
+  }
+  log(`Detected language: ${best} (${Date.now() - t0} ms)`)
+  return best
+}
+
+// A dictation detects once (on its first chunk) and keeps that language for
+// every following chunk - consistent output, and the extra encoder pass is
+// paid only once. Keyed by main's dictation id; small, bounded cache.
+/** @type {Map<unknown, string>} */
+const detectedBySession = new Map()
+
+/**
+ * Language to transcribe with: the configured one, or for 'auto' the detected
+ * ISO code. `name` is the Whisper language name for post-processing (null if
+ * the detected language isn't one we offer).
+ * @returns {Promise<{ whisper: string, name: string | null }>}
+ */
+async function resolveLanguage(pipe, pcm, language, sessionKey) {
+  if (language !== 'auto') return { whisper: language, name: language }
+  let code = sessionKey != null ? detectedBySession.get(sessionKey) : undefined
+  if (!code) {
+    code = await detectLanguage(pipe, pcm)
+    if (sessionKey != null) {
+      detectedBySession.set(sessionKey, code)
+      if (detectedBySession.size > 20) detectedBySession.delete(detectedBySession.keys().next().value)
+    }
+  }
+  return { whisper: code, name: languageFromCode(code) }
+}
+
 /**
  * @param {any} pipeline
  * @param {Float32Array} pcm
- * @param {{ language: string, maxNewTokens?: number, onProgress?: ((pct: number, chunk: number, totalChunks: number) => void) | null, stopper?: any, applyMarkers?: boolean }} opts
+ * @param {{ language: string, maxNewTokens?: number, onProgress?: ((pct: number, chunk: number, totalChunks: number) => void) | null, stopper?: any, applyMarkers?: boolean, sessionKey?: unknown }} opts
+ * @returns {Promise<{ text: string, language: string | null }>}
  */
-async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgress = null, stopper = null, applyMarkers = true }) {
+async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgress = null, stopper = null, applyMarkers = true, sessionKey = null }) {
   const durationSeconds = pcm.length / WHISPER_SAMPLE_RATE
+  const lang = await resolveLanguage(pipeline, pcm, language, sessionKey)
   const genOptions = {
-    language,
+    language: lang.whisper,
     task: 'transcribe',
     // Whisper internally processes only a fixed 30s window - without chunking
     // everything after that is silently cut off. chunk_length_s enables
@@ -318,7 +376,7 @@ async function transcribe(pipeline, pcm, { language, maxNewTokens = 440, onProgr
   // typographic quotes for the current language (see dictation.js). Live
   // dictation chunks skip this (applyMarkers: false): a marker phrase can span
   // a chunk boundary, so main applies it once to the full transcript.
-  return applyMarkers ? applyDictationMarkers(text, language) : text
+  return { text: applyMarkers ? applyMarkersFor(text, lang.name ?? 'auto') : text, language: lang.name }
 }
 
 async function disposePipeline(pipe) {
@@ -447,7 +505,7 @@ async function loadLlm(modelUri) {
  * A fresh context is created per call and disposed afterwards so the multi-GB
  * KV cache doesn't accumulate; the model itself stays resident.
  */
-async function summarize(text, language, modelUri) {
+async function summarize(text, language, modelUri, mode = 'summarize') {
   if (!text || !text.trim()) return ''
   await loadLlm(modelUri)
   const { LlamaChatSession } = await import('node-llama-cpp')
@@ -456,13 +514,20 @@ async function summarize(text, language, modelUri) {
   llmBusy = true
   /** @type {any} */ let context = null
   try {
-    context = await llmModel.createContext({ contextSize: 4096 })
+    // Rewriting modes (clean-up, e-mail, translation) produce output about as
+    // long as the input, a summary stays short. Rough token estimate: ~3 chars
+    // per token. The context must hold prompt + input + output; 4096 covers
+    // normal dictations, long ones grow it (bounded - the KV cache is RAM).
+    const inputTokens = Math.ceil(text.length / 3)
+    const maxTokens = mode === 'summarize' || mode === 'bullets' ? 400 : Math.min(3000, inputTokens + 200)
+    const contextSize = Math.min(8192, Math.max(4096, inputTokens + maxTokens + 512))
+    context = await llmModel.createContext({ contextSize })
     const session = new LlamaChatSession({
       contextSequence: context.getSequence(),
-      systemPrompt: buildSystemPrompt(language),
+      systemPrompt: buildSystemPrompt(language, mode),
     })
     const t0 = Date.now()
-    const out = await session.prompt(text.trim(), { maxTokens: 400, temperature: 0.3 })
+    const out = await session.prompt(text.trim(), { maxTokens, temperature: 0.3 })
     log(`summarize(): done after ${((Date.now() - t0) / 1000).toFixed(1)}s`)
     return cleanSummary(out)
   } finally {
@@ -530,15 +595,15 @@ async function handlePreloadModel({ id, model }) {
 
 // Dictation transcription on the warm pipeline (queued). Rebuilds the pipeline
 // first if a file job freed it and the background reload didn't run yet.
-async function handleTranscribe({ id, pcm, language, maxNewTokens, applyMarkers }) {
+async function handleTranscribe({ id, pcm, language, maxNewTokens, applyMarkers, sessionKey }) {
   try {
-    const text = await enqueue(async () => {
+    const res = await enqueue(async () => {
       await ensureDictationPipeline()
       if (!whisperPipeline) throw new Error('No model loaded')
       const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm)
-      return transcribe(whisperPipeline, samples, { language, maxNewTokens, applyMarkers: applyMarkers !== false })
+      return transcribe(whisperPipeline, samples, { language, maxNewTokens, applyMarkers: applyMarkers !== false, sessionKey })
     })
-    ok(id, { text })
+    ok(id, res)
   } catch (err) {
     fail(id, err)
   }
@@ -563,16 +628,17 @@ async function handleTranscribeFile({ id, filePath, model, language }) {
     const onProgress = (pct, chunk, totalChunks) => post({ type: 'progress', id, pct, chunk, totalChunks })
     const opts = { language, maxNewTokens: 444, onProgress, stopper: job.stopper }
 
-    let text
+    /** @type {{ text: string, language: string | null }} */
+    let res
     let usedTempModel = false
     if (model === loadedModel && whisperPipeline) {
-      text = await enqueue(() => {
+      res = await enqueue(() => {
         if (job.cancelled) throw cancelledError() // cancelled while queued
         return transcribe(whisperPipeline, pcm, opts)
       })
     } else {
       usedTempModel = true
-      text = await enqueue(async () => {
+      res = await enqueue(async () => {
         if (job.cancelled) throw cancelledError() // cancelled while queued
         // Free the dictation model for the duration of the file job. Two
         // multi-GB ONNX sessions plus inference activations in one process is
@@ -594,7 +660,7 @@ async function handleTranscribeFile({ id, filePath, model, language }) {
         }
       })
     }
-    ok(id, { text })
+    ok(id, res)
     if (usedTempModel) scheduleDictationReload()
   } catch (err) {
     if (!(/** @type {any} */ (err)?.cancelled)) logErr('File transcription error:', errMsg(err))
@@ -613,9 +679,9 @@ function handleCancelFile() {
   try { activeFileJob.ffmpeg?.kill('SIGKILL') } catch { /* already exited */ }
 }
 
-async function handleSummarize({ id, text, language, llmModelUri }) {
+async function handleSummarize({ id, text, language, llmModelUri, mode }) {
   try {
-    const summary = await summarize(String(text || ''), language, llmModelUri)
+    const summary = await summarize(String(text || ''), language, llmModelUri, mode)
     ok(id, { summary })
   } catch (err) {
     logErr('Summarization error:', errMsg(err))

@@ -17,7 +17,7 @@ contextBridge.exposeInMainWorld('whisper', {
   onStartRecording: (cb) => ipcRenderer.on('start-recording', (_e, id) => cb(id)),
   onStopRecording:  (cb) => ipcRenderer.on('stop-recording', cb),
   onTranscribing:   (cb) => ipcRenderer.on('transcribing', cb),
-  onSummarizing:    (cb) => ipcRenderer.on('summarizing', cb),
+  onSummarizing:    (cb) => ipcRenderer.on('summarizing', (_e, mode) => cb(mode)),
   onDone:           (cb) => ipcRenderer.on('done', cb),
   onModelLoading:   (cb) => ipcRenderer.on('model-loading', (_e, data) => cb(data)),
   sendChunk:        (id, pcm, final) => ipcRenderer.send('dictation-chunk', { id, pcm, final }),

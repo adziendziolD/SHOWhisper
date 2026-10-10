@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test')
 const assert = require('node:assert/strict')
-const { buildSystemPrompt, cleanSummary, SYSTEM_PROMPTS } = require('../src/shared/summarize')
+const { buildSystemPrompt, cleanSummary, SYSTEM_PROMPTS, AI_MODES } = require('../src/shared/summarize')
 
 describe('buildSystemPrompt', () => {
   it('returns the prompt of each language', () => {
@@ -16,10 +16,28 @@ describe('buildSystemPrompt', () => {
     assert.match(SYSTEM_PROMPTS.french, /en français/)
   })
 
-  it('falls back to german for unknown/missing languages', () => {
-    assert.equal(buildSystemPrompt('spanish'), SYSTEM_PROMPTS.german)
-    assert.equal(buildSystemPrompt(''), SYSTEM_PROMPTS.german)
-    assert.equal(buildSystemPrompt(/** @type {any} */ (undefined)), SYSTEM_PROMPTS.german)
+  it('asks other languages and auto-detect to answer in the text language', () => {
+    assert.match(buildSystemPrompt('spanish'), /Summarize[\s\S]*Respond in Spanish\./)
+    for (const l of ['auto', '', /** @type {any} */ (undefined), 'constructor']) {
+      const p = buildSystemPrompt(l)
+      assert.notEqual(p, SYSTEM_PROMPTS.german)
+      assert.match(p, l === 'constructor' ? /Respond in Constructor/ : /same language as the text/)
+    }
+  })
+
+  it('builds a prompt for every AI mode', () => {
+    for (const mode of AI_MODES) {
+      const p = buildSystemPrompt('german', mode)
+      assert.ok(p.length > 0)
+      if (mode === 'summarize') assert.equal(p, SYSTEM_PROMPTS.german)
+      else if (mode === 'translate-en') assert.doesNotMatch(p, /Respond in/)
+      else assert.match(p, /Respond in German\./)
+      assert.match(buildSystemPrompt('auto', mode), mode === 'translate-en' ? /English/ : /same language/)
+    }
+  })
+
+  it('treats unknown modes as summarize', () => {
+    assert.equal(buildSystemPrompt('english', 'nonsense'), SYSTEM_PROMPTS.english)
   })
 })
 

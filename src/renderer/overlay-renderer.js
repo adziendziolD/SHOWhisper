@@ -316,7 +316,13 @@ window.whisper.onLiveText((text)   => {
   // words are the ones visible.
   liveTextEl.textContent = text.length > 90 ? `…${text.slice(-90)}` : text
 })
-window.whisper.onSummarizing(()    => setState('summarizing'))
+window.whisper.onSummarizing((mode) => {
+  // The AI hotkey does more than summarize (see 'aiMode') - name the action.
+  const label = /** @type {HTMLElement} */ (document.getElementById('ai-label'))
+  label.dataset.i18n = mode ? `overlay.ai.${mode}` : 'overlay.summarizing'
+  label.textContent = window.i18n.t(uiLang, label.dataset.i18n)
+  setState('summarizing')
+})
 window.whisper.onDone(()           => setState('done'))
 window.whisper.onModelLoading(handleModelLoading)
 
@@ -327,7 +333,10 @@ window.whisper.onModelLoading(handleModelLoading)
 window.whisper.overlayReady()
 
 // ── i18n ──────────────────────────────────────────────────────────────────────
+/** @type {Language} */
+let uiLang = 'german'
 function applyI18n(lang) {
+  uiLang = lang
   document.querySelectorAll('[data-i18n]').forEach((el) => {
     const htmlEl = /** @type {HTMLElement} */ (el)
     htmlEl.textContent = window.i18n.t(lang, htmlEl.dataset.i18n ?? '')

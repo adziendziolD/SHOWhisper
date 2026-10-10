@@ -2,13 +2,26 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, screen, systemPrefer
 const path = require('path')
 const fs = require('fs')
 const { t, translations } = require('../shared/i18n')
-const { applyDictationMarkers } = require('../shared/dictation')
+const { postprocessDictation, applyReplacements, parseReplacements, formatReplacements } = require('../shared/postprocess')
+const { TRANSCRIPTION_LANGUAGES, UI_LANGUAGES, isTranscriptionLanguage, defaultsForLocale } = require('../shared/languages')
+const { AI_MODES } = require('../shared/summarize')
 const elog = require('electron-log/main')
 
 const isDev = process.env.NODE_ENV === 'development'
 // `SHOWhisper --smoke-test`: CI check of the packaged app - load every native
 // module (in main and in the worker), print SMOKE OK and exit. See runSmokeTest.
 const isSmokeTest = process.argv.includes('--smoke-test')
+// `SHOWhisper --e2e-dictation=<file.wav>`: end-to-end test of the real
+// dictation path (overlay capture → chunking → worker → post-processing)
+// with Chromium's fake microphone playing the WAV. Prints the transcript
+// instead of pasting and exits. Model: env SHOWHISPER_E2E_MODEL (default tiny).
+const e2eAudio = process.argv.find((a) => a.startsWith('--e2e-dictation='))?.slice('--e2e-dictation='.length) || null
+if (e2eAudio) {
+  app.commandLine.appendSwitch('use-fake-device-for-media-stream')
+  app.commandLine.appendSwitch('use-fake-ui-for-media-stream')
+  app.commandLine.appendSwitch('use-file-for-fake-audio-capture', `${path.resolve(e2eAudio)}%noloop`)
+  if (process.env.SHOWHISPER_E2E_USER_DATA) app.setPath('userData', process.env.SHOWHISPER_E2E_USER_DATA)
+}
 
 // Don't crash on EPIPE (e.g. when the terminal is closed)
 process.stdout.on('error', (e) => { if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EPIPE') throw e })
@@ -64,10 +77,27 @@ function errMsg(e) { return e instanceof Error ? e.message : String(e) }
 /** @type {import('electron-store').default<Record<string, unknown>>} */
 let store
 
-// Translate a UI string into the currently selected language (see i18n.js).
+// The language you speak (Whisper language name, or 'auto' = detect) and the
+// language of the app's own UI are separate settings: Whisper knows ~100
+// languages, the UI is translated into three. Installs from before the split
+// only have 'language' - if that's a UI language, the UI follows it.
+function transcriptionLanguage() {
+  const lang = store.get('language')
+  return isTranscriptionLanguage(lang) ? /** @type {string} */ (lang) : defaultsForLocale(app.getLocale()).language
+}
+
+function uiLang() {
+  const ui = store.get('uiLanguage')
+  if (typeof ui === 'string' && UI_LANGUAGES.includes(ui)) return ui
+  const lang = store.get('language')
+  if (typeof lang === 'string' && UI_LANGUAGES.includes(lang)) return lang
+  return defaultsForLocale(app.getLocale()).uiLanguage
+}
+
+// Translate a UI string into the current UI language (see i18n.js).
 // Only called after the store is ready (tray/dialogs run after whenReady).
 function tr(key, vars) {
-  return t(store.get('language', 'german'), key, vars)
+  return t(uiLang(), key, vars)
 }
 
 /** @type {import('electron').Tray} */
@@ -78,6 +108,8 @@ let overlayWindow = null
 let settingsWindow = null
 /** @type {import('electron').BrowserWindow | null} */
 let resultWindow = null        // file-transcription result window
+/** @type {import('electron').BrowserWindow | null} */
+let onboardingWindow = null    // first-run setup
 /** @type {any} */
 let lastFileStatus = null      // replayed to the result window once it's listening
 /** @type {string | null} */
@@ -94,8 +126,6 @@ let isRecording = false        // hotkey toggle state (⌥Space starts/stops rec
 let dictationCount = 0         // >0 while a live-dictation flow (transcribe/summarize/paste) runs
 let lastToggleAt = 0           // debounce against globalShortcut key auto-repeat
 let loadedDevice = 'cpu'       // device of the dictation model ('coreml' | 'dml' | 'cpu')
-// Supported transcription languages (Whisper language names)
-const LANGUAGES = ['german', 'english', 'french']
 // All models load from the public Xenova HuggingFace namespace, which hosts all
 // five sizes and needs no access token.
 const PROVIDER = 'Xenova'
@@ -258,6 +288,9 @@ function createOverlay() {
   })
 
   overlayWindow.loadFile(path.join(__dirname, '../renderer/overlay.html'))
+  // Recording runs in this renderer - in the e2e run, its console is the only
+  // window into capture/chunking problems.
+  if (e2eAudio) overlayWindow.webContents.on('console-message', (e) => log(`[overlay] ${/** @type {any} */ (e).message}`))
 
   if (isDev) {
     overlayWindow.webContents.openDevTools({ mode: 'detach' })
@@ -297,6 +330,7 @@ let lastModelProgress = null
 function sendModelProgress(data) {
   lastModelProgress = data
   sendToSettings(data)
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) onboardingWindow.webContents.send('model-progress', data)
   overlayWindow?.webContents.send('model-loading', data)
 }
 
@@ -375,10 +409,11 @@ function loadModel(modelName) {
   return modelReadyPromise
 }
 
-function summarizeText(text, language) {
+function summarizeText(text, language, mode = 'summarize') {
   return workerRequest('summarize', {
     text,
     language,
+    mode,
     llmModelUri: /** @type {string} */ (store.get('llmModelUri', DEFAULT_LLM_URI)),
   }).then((r) => r.summary)
 }
@@ -465,11 +500,11 @@ async function transcribeFileFlow(filePath) {
     const res = await workerRequest('transcribe-file', {
       filePath,
       model,
-      language: /** @type {string} */ (store.get('language', 'german')),
+      language: transcriptionLanguage(),
     }, {
       onProgress: (p) => sendFileStatus({ status: 'progress', progress: p.pct, chunk: p.chunk, totalChunks: p.totalChunks }),
     })
-    const transcript = res.text
+    const transcript = applyReplacements(res.text, getReplacements())
     log(isDev ? `File transcription: "${transcript}"` : `File transcription done (${transcript.length} chars)`)
     sendFileStatus({ status: 'done', name: path.basename(filePath), transcript, model })
   } catch (err) {
@@ -595,8 +630,7 @@ ipcMain.on('result-copy', (_e, text) => {
 })
 
 ipcMain.handle('result-summarize', async (_e, text) => {
-  const language = /** @type {string} */ (store.get('language', 'german'))
-  return summarizeText(String(text || ''), language)
+  return summarizeText(String(text || ''), transcriptionLanguage())
 })
 
 ipcMain.handle('result-save', async (_e, text) => {
@@ -641,6 +675,88 @@ function openSettings() {
   settingsWindow.on('closed', () => { settingsWindow = null })
 }
 
+// ── First-run setup (onboarding) ───────────────────────────────────────────────
+// Walks through what otherwise surfaces as "it doesn't work": microphone and
+// (macOS) Accessibility permission, choosing + downloading a model, and a
+// live test of the hotkey into a text field.
+
+function openOnboarding() {
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) { onboardingWindow.focus(); return }
+  onboardingWindow = new BrowserWindow({
+    width: 520,
+    height: 680,
+    resizable: false,
+    show: false,
+    title: 'SHOWhisper',
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/onboarding-preload.js'),
+      contextIsolation: true,
+    },
+  })
+  onboardingWindow.loadFile(path.join(__dirname, '../renderer/onboarding.html'))
+  onboardingWindow.once('ready-to-show', () => { onboardingWindow?.show(); onboardingWindow?.focus() })
+  if (isDev) onboardingWindow.webContents.openDevTools({ mode: 'detach' })
+  onboardingWindow.on('closed', () => {
+    onboardingWindow = null
+    // Closed without picking a model: load the default, so the hotkey works.
+    if (!loadedModel && loadingCount === 0) loadModel(/** @type {string} */ (store.get('model', 'small')))
+  })
+}
+
+function permissionStatus() {
+  const mac = process.platform === 'darwin'
+  return {
+    platform: process.platform,
+    // Linux has no OS-level microphone permission API.
+    microphone: process.platform === 'linux' ? 'granted' : systemPreferences.getMediaAccessStatus('microphone'),
+    accessibility: mac ? systemPreferences.isTrustedAccessibilityClient(false) : true,
+  }
+}
+
+ipcMain.handle('onboarding-status', () => ({
+  ...permissionStatus(),
+  models: MODELS.filter((m) => m !== 'large'), // large is for file transcription, too slow live
+  labels: MODEL_LABELS,
+  model: store.get('model', 'small'),
+  loadedModel,
+  loading: loadingCount > 0,
+  cached: MODELS.filter((m) => isModelCached(m)),
+  settings: settingsSnapshot(),
+}))
+
+ipcMain.handle('onboarding-request-mic', async () => {
+  if (process.platform === 'darwin') {
+    try { await systemPreferences.askForMediaAccess('microphone') } catch (err) { logErr('Mic access request failed:', errMsg(err)) }
+  }
+  return permissionStatus()
+})
+
+ipcMain.on('onboarding-open-privacy', (_e, what) => {
+  const urls = {
+    darwin: {
+      microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+      accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+    },
+    win32: { microphone: 'ms-settings:privacy-microphone' },
+  }
+  // Registers the app in the Accessibility list (and shows Apple's prompt), so
+  // the user only has to flip the switch.
+  if (process.platform === 'darwin' && what === 'accessibility') systemPreferences.isTrustedAccessibilityClient(true)
+  const url = urls[process.platform]?.[what]
+  if (url) shell.openExternal(url)
+})
+
+ipcMain.handle('onboarding-load-model', async (_e, model) => {
+  if (!MODELS.includes(model)) return false
+  return loadModel(model)
+})
+
+ipcMain.on('onboarding-done', () => {
+  store.set('onboarded', true)
+  log('Onboarding completed')
+  onboardingWindow?.close()
+})
+
 // The settings content height is dynamic: the cache list grows with the number
 // of cached models, and the download progress box appears/disappears. A fixed
 // window height either cut off the cache list or left dead space. The renderer
@@ -658,22 +774,220 @@ ipcMain.on('settings-resize', (_e, height) => {
 
 // Transcription language is a per-transcribe option, not baked into the loaded
 // model - so save it instantly on change, no model reload needed.
+// Live-update the localized UI: rebuild the tray menu and tell every window
+// to re-apply its translations.
+function broadcastUiLanguage() {
+  const lang = uiLang()
+  buildTrayMenu()
+  for (const w of [overlayWindow, settingsWindow, resultWindow, onboardingWindow]) {
+    if (w && !w.isDestroyed()) w.webContents.send('language-changed', lang)
+  }
+}
+
+// Transcription language (kept for the settings/onboarding pages; the generic
+// 'settings-set' covers it too).
 ipcMain.on('set-language', (_e, lang) => {
-  if (!LANGUAGES.includes(lang)) return
+  if (!isTranscriptionLanguage(lang)) return
   store.set('language', lang)
   log('Language set:', lang)
-  // Live-update the localized UI: rebuild the tray menu and tell the windows
-  // to re-apply their translations.
-  buildTrayMenu()
-  overlayWindow?.webContents.send('language-changed', lang)
-  settingsWindow?.webContents.send('language-changed', lang)
+  broadcastUiLanguage() // the UI follows it while no explicit UI language is set
 })
 
-ipcMain.handle('get-language', () => store.get('language', 'german'))
+// The UI language - what every window localizes itself into.
+ipcMain.handle('get-language', () => uiLang())
 
 // Renderers are sandboxed and can't require('./i18n'), so hand them the whole
 // dictionary synchronously at preload time; they run the same small t() locally.
 ipcMain.on('i18n-sync', (e) => { e.returnValue = translations })
+
+// ── Settings (generic get/set for the settings + onboarding windows) ─────────
+
+/** @returns {import('../shared/postprocess').Replacement[]} */
+function getReplacements() {
+  const r = store.get('replacements', [])
+  return Array.isArray(r) ? r : []
+}
+
+function getAiMode() {
+  const m = store.get('aiMode', 'summarize')
+  return typeof m === 'string' && AI_MODES.includes(m) ? m : 'summarize'
+}
+
+function settingsSnapshot() {
+  return {
+    language: transcriptionLanguage(),
+    uiLanguage: uiLang(),
+    languages: TRANSCRIPTION_LANGUAGES,     // name -> ISO code (labels via Intl.DisplayNames)
+    uiLanguages: UI_LANGUAGES,
+    hotkeyDictate: hotkeyFor('hotkeyDictate'),
+    hotkeyAi: hotkeyFor('hotkeyAi'),
+    hotkeyDictateLabel: formatAccelerator(hotkeyFor('hotkeyDictate')),
+    hotkeyAiLabel: formatAccelerator(hotkeyFor('hotkeyAi')),
+    hotkeyStatus: { ...hotkeyStatus },
+    aiMode: getAiMode(),
+    aiModes: AI_MODES,
+    gpu: store.get('gpu', true) !== false,
+    gpuAutoDisabled: store.get('gpuAutoDisabled', false) === true,
+    device: loadedDevice,
+    voiceCommands: store.get('voiceCommands', true) !== false,
+    history: store.get('history', true) !== false,
+    replacements: formatReplacements(getReplacements()),
+    platform: process.platform,
+    version: app.getVersion(),
+  }
+}
+
+/** @returns {string | null} error code, null on success */
+function applySetting(key, value) {
+  switch (key) {
+    case 'language':
+      if (!isTranscriptionLanguage(value)) return 'invalid'
+      store.set('language', value)
+      broadcastUiLanguage()
+      return null
+    case 'uiLanguage':
+      if (!UI_LANGUAGES.includes(value)) return 'invalid'
+      store.set('uiLanguage', value)
+      broadcastUiLanguage()
+      return null
+    case 'hotkeyDictate':
+    case 'hotkeyAi':
+      return setHotkey(key, value)
+    case 'aiMode':
+      if (!AI_MODES.includes(value)) return 'invalid'
+      store.set('aiMode', value)
+      return null
+    case 'gpu':
+      if (typeof value !== 'boolean') return 'invalid'
+      store.set('gpu', value)
+      if (value) store.delete('gpuAutoDisabled') // explicit opt-in: try again
+      worker?.postMessage({ type: 'config', gpu: gpuEnabled() })
+      // Rebuild the dictation pipeline on the new device (queued behind any
+      // running transcription on the worker).
+      if (loadedModel) loadModel(loadedModel)
+      return null
+    case 'voiceCommands':
+    case 'history':
+      if (typeof value !== 'boolean') return 'invalid'
+      store.set(key, value)
+      if (key === 'history' && !value) clearHistory()
+      return null
+    case 'replacements':
+      if (typeof value !== 'string' || value.length > 100_000) return 'invalid'
+      store.set('replacements', parseReplacements(value).slice(0, 1000))
+      return null
+    default:
+      return 'unknown'
+  }
+}
+
+ipcMain.handle('settings-get', () => settingsSnapshot())
+ipcMain.handle('settings-set', (_e, key, value) => {
+  const error = applySetting(key, value)
+  if (error) logErr(`Setting ${key} rejected: ${error}`)
+  return { error, settings: settingsSnapshot() }
+})
+
+// While the settings window records a new hotkey, the current ones must not
+// fire (pressing ⌥Space to re-enter it would start a dictation).
+ipcMain.on('hotkeys-suspend', (_e, suspend) => {
+  if (suspend) globalShortcut.unregisterAll()
+  else registerHotkeys()
+})
+
+ipcMain.on('history-clear', () => clearHistory())
+
+// ── Dictation history ──────────────────────────────────────────────────────────
+// The last few pasted texts, so nothing is lost when auto-paste lands in the
+// wrong window (or none). Local file only, can be switched off in the settings.
+
+const HISTORY_FILE = path.join(app.getPath('userData'), 'history.json')
+const HISTORY_MAX = 30
+
+/** @returns {{ at: number, text: string }[]} */
+function readHistory() {
+  try {
+    const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
+    return Array.isArray(h) ? h.filter((e) => e && typeof e.text === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function addHistory(text) {
+  if (!text || store.get('history', true) === false) return
+  const h = [{ at: Date.now(), text }, ...readHistory()].slice(0, HISTORY_MAX)
+  try {
+    // Write + rename: a crash mid-write never leaves a truncated file.
+    fs.writeFileSync(`${HISTORY_FILE}.tmp`, JSON.stringify(h), 'utf8')
+    fs.renameSync(`${HISTORY_FILE}.tmp`, HISTORY_FILE)
+  } catch (err) {
+    logErr('History write failed:', errMsg(err))
+  }
+  buildTrayMenu()
+}
+
+function clearHistory() {
+  try { fs.rmSync(HISTORY_FILE, { force: true }) } catch (err) { logErr('History clear failed:', errMsg(err)) }
+  buildTrayMenu()
+}
+
+function historyMenu() {
+  const entries = readHistory().slice(0, 10)
+  /** @type {import('electron').MenuItemConstructorOptions[]} */
+  const items = entries.map((e) => {
+    const time = new Date(e.at).toLocaleTimeString(app.getLocale(), { hour: '2-digit', minute: '2-digit' })
+    const oneLine = e.text.replace(/\s+/g, ' ').trim()
+    return {
+      label: `${time}  ${oneLine.length > 48 ? `${oneLine.slice(0, 48)}…` : oneLine}`,
+      click: () => clipboard.writeText(e.text),
+    }
+  })
+  if (items.length === 0) items.push({ label: tr('menu.history.empty'), enabled: false })
+  else items.push({ type: 'separator' }, { label: tr('menu.history.clear'), click: clearHistory })
+  return items
+}
+
+// ── Diagnostics export ─────────────────────────────────────────────────────────
+// One text file with versions, system info, settings and the recent log, for
+// bug reports. Production logs never contain dictated text (see log()).
+
+async function exportDiagnostics() {
+  const os = require('os')
+  const stamp = new Date().toISOString().slice(0, 10)
+  const res = await dialog.showSaveDialog({
+    defaultPath: path.join(app.getPath('desktop'), `showhisper-diagnostics-${stamp}.txt`),
+    filters: [{ name: 'Text', extensions: ['txt'] }],
+  })
+  if (res.canceled || !res.filePath) return
+  const settings = settingsSnapshot()
+  const info = {
+    app: app.getVersion(),
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+    node: process.versions.node,
+    os: `${process.platform} ${os.release()} (${process.arch})`,
+    cpu: `${os.cpus()[0]?.model ?? '?'} ×${os.cpus().length}`,
+    memoryGB: Math.round(os.totalmem() / 1e9),
+    model: store.get('model'),
+    loadedModel,
+    device: loadedDevice,
+    accessibility: process.platform === 'darwin' ? systemPreferences.isTrustedAccessibilityClient(false) : 'n/a',
+    microphone: process.platform === 'linux' ? 'n/a' : systemPreferences.getMediaAccessStatus('microphone'),
+    settings: { ...settings, languages: undefined, replacements: `${getReplacements().length} rules` },
+    cache: listCachedModels().map((m) => `${m.provider}/${m.model} ${Math.round(m.sizeBytes / 1e6)} MB`),
+  }
+  const logPath = elog.transports.file.getFile()?.path
+  let logs = ''
+  if (logPath) {
+    for (const f of [logPath.replace(/\.log$/, '.1.log'), logPath]) {
+      try { logs += `\n===== ${path.basename(f)} =====\n${fs.readFileSync(f, 'utf8').slice(-400_000)}` } catch { /* missing */ }
+    }
+  }
+  fs.writeFileSync(res.filePath, `SHOWhisper diagnostics\n${JSON.stringify(info, null, 2)}\n${logs}`, 'utf8')
+  log('Diagnostics exported:', res.filePath)
+  shell.showItemInFolder(res.filePath)
+}
 
 // ── Model cache ────────────────────────────────────────────────────────────────
 // Cached models live as `<provider>/whisper-<model>/` folders under
@@ -795,6 +1109,7 @@ ipcMain.on('cache-open', () => {
 // chunk for an unknown/abandoned id is simply ignored.
 /**
  * @typedef {{ text: string, summarizeMode: boolean, language: string,
+ *             detectedLanguage: string | null,
  *             tail: Promise<void>, finalizing: boolean }} LiveSession
  */
 /** @type {Map<number, LiveSession>} */
@@ -829,13 +1144,16 @@ ipcMain.on('dictation-chunk', (_event, { id, pcm, final }) => {
     // Catch right here, not via `tail`: the request may fail while earlier
     // chunks are still pending (unhandled rejection otherwise). A lost chunk
     // only loses its words - the dictation itself still finishes.
-    const req = workerRequest('transcribe', { pcm, language: session.language, maxNewTokens: 440, applyMarkers: false })
-      .catch((err) => { logErr('Live transcription error:', errMsg(err)); return { text: '' } })
+    // sessionKey: with 'auto', the worker detects the language on the first
+    // chunk and keeps it for the rest of this dictation.
+    const req = workerRequest('transcribe', { pcm, language: session.language, maxNewTokens: 440, applyMarkers: false, sessionKey: id })
+      .catch((err) => { logErr('Live transcription error:', errMsg(err)); return { text: '', language: null } })
     session.tail = session.tail.then(() => req).then((res) => {
+      if (res.language && !session.detectedLanguage) session.detectedLanguage = res.language
       if (!res.text) return
       session.text = session.text ? `${session.text} ${res.text}` : res.text
       // Only log the recognized text in dev mode (privacy for dictation).
-      log(isDev ? `Live transcription: "${res.text}"` : `Live transcription done (${res.text.length} chars)`)
+      log(isDev || e2eAudio ? `Live transcription: "${res.text}"` : `Live transcription done (${res.text.length} chars)`)
       if (isRecording) sendDictationStatus(id, 'live-text', session.text)
     }).catch((err) => logErr('Live transcription error:', errMsg(err))) // never break the tail
   }
@@ -851,22 +1169,36 @@ async function finalizeDictation(id, session) {
   sendDictationStatus(id, 'transcribing')
   await session.tail
   liveSessions.delete(id)
-  const { language } = session
-  const transcript = applyDictationMarkers(session.text.trim(), language)
+  // With auto-detect, post-process for the language actually spoken.
+  const language = session.language === 'auto' ? (session.detectedLanguage || 'auto') : session.language
+  const transcript = postprocessDictation(session.text.trim(), {
+    language,
+    voiceCommands: store.get('voiceCommands', true) !== false,
+    replacements: getReplacements(),
+  })
   log(isDev ? `Transcription: "${transcript}"` : `Transcription done (${transcript.length} chars)`)
 
-  // In summarize mode, run the transcript through the local LLM. On any failure
-  // fall back to pasting the raw transcript (dictation must never be lost).
+  // With the AI hotkey, run the transcript through the local LLM (summary,
+  // e-mail, clean-up, ... - see 'aiMode'). On any failure fall back to
+  // pasting the raw transcript (dictation must never be lost).
   let toPaste = transcript
   let summarized = false
   if (session.summarizeMode && transcript) {
-    sendDictationStatus(id, 'summarizing')
+    const mode = getAiMode()
+    sendDictationStatus(id, 'summarizing', mode)
     try {
-      const summary = await summarizeText(transcript, language)
+      const summary = await summarizeText(transcript, language, mode)
       if (summary) { toPaste = summary; summarized = true }
     } catch (err) {
-      logErr('Summarization error:', errMsg(err))
+      logErr('AI action error:', errMsg(err))
     }
+  }
+  addHistory(toPaste)
+
+  if (e2eAudio) {
+    console.log(`E2E TRANSCRIPT: ${JSON.stringify(toPaste)} (language: ${language})`)
+    app.exit(toPaste ? 0 : 1)
+    return
   }
 
   try {
@@ -970,7 +1302,7 @@ ipcMain.on('recording-failed', (_e, { id, message }) => {
   if (!settingsWindow || settingsWindow.isDestroyed()) {
     dialog.showErrorBox(
       tr('dialog.mic.title'),
-      tr('dialog.mic.body', { error: message || tr('error.unknown') })
+      tr('dialog.mic.body', { error: message || tr('error.unknown'), hint: tr(`dialog.mic.hint.${process.platform}`) })
     )
   }
 })
@@ -995,6 +1327,7 @@ function buildTrayMenu() {
     { label: 'SHOWhisper', enabled: false },
     { type: 'separator' },
     { label: tr('menu.transcribeFile'), click: () => openResultWindow() },
+    { label: tr('menu.history'), submenu: historyMenu() },
     { label: tr('menu.settings'), click: openSettings },
     {
       label: tr('menu.autostart'),
@@ -1013,7 +1346,9 @@ function buildTrayMenu() {
     { label: tr('menu.model'), enabled: false },
     ...modelItems,
     { type: 'separator' },
-    { label: tr('menu.quit'), click: () => app.quit() },
+    { label: tr('menu.onboarding'), click: openOnboarding },
+    { label: tr('menu.diagnostics'), click: () => { exportDiagnostics().catch((err) => logErr('Diagnostics export failed:', errMsg(err))) } },
+    { label: `${tr('menu.quit')}  (v${app.getVersion()})`, click: () => app.quit() },
   ])
 
   tray.setContextMenu(menu)
@@ -1038,15 +1373,82 @@ function setTrayRecording(recording) {
 
 // ── Hotkey (Toggle) ────────────────────────────────────────────────────────────
 
-const HOTKEY_ACCELERATOR = 'Alt+Space'             // ⌥Space: raw dictation
-const HOTKEY_SUMMARIZE = 'Alt+Shift+Space'         // ⌥⇧Space: dictation + summary
+// Defaults: ⌥Space = dictation, ⌥⇧Space = dictation + AI action (summary by
+// default, see 'aiMode'). Both are configurable in the settings; the AI
+// hotkey may be empty (disabled).
+const DEFAULT_HOTKEYS = { hotkeyDictate: 'Alt+Space', hotkeyAi: 'Alt+Shift+Space' }
+/** @type {{ hotkeyDictate: boolean, hotkeyAi: boolean }} */
+const hotkeyStatus = { hotkeyDictate: false, hotkeyAi: false }
+
+/** @param {'hotkeyDictate' | 'hotkeyAi'} key */
+function hotkeyFor(key) {
+  const v = store.get(key)
+  return typeof v === 'string' ? v : DEFAULT_HOTKEYS[key]
+}
+
+// Human-readable accelerator: macOS symbols (⌥⇧Space), elsewhere "Alt+Shift+Space".
+function formatAccelerator(acc) {
+  if (!acc) return ''
+  if (process.platform !== 'darwin') return acc.replace(/CommandOrControl|CmdOrCtrl/g, 'Ctrl').replace(/Super|Meta/g, 'Win')
+  const SYMBOLS = {
+    Command: '⌘', Cmd: '⌘', CommandOrControl: '⌘', CmdOrCtrl: '⌘', Super: '⌘', Meta: '⌘',
+    Control: '⌃', Ctrl: '⌃', Alt: '⌥', Option: '⌥', AltGr: '⌥', Shift: '⇧',
+  }
+  return acc.split('+').map((k) => SYMBOLS[k] ?? k).join('')
+}
+
+// (Re)register both hotkeys from the store. Registration fails when another
+// app already owns the combo (or the accelerator is malformed).
+function registerHotkeys() {
+  globalShortcut.unregisterAll()
+  /** @type {Record<'hotkeyDictate' | 'hotkeyAi', () => void>} */
+  const handlers = { hotkeyDictate: () => toggleRecording(false), hotkeyAi: () => toggleRecording(true) }
+  for (const key of /** @type {const} */ (['hotkeyDictate', 'hotkeyAi'])) {
+    const acc = hotkeyFor(key)
+    let ok = false
+    if (acc) {
+      try {
+        ok = globalShortcut.register(acc, handlers[key]) && globalShortcut.isRegistered(acc)
+      } catch (err) {
+        logErr(`Invalid accelerator ${acc}:`, errMsg(err))
+      }
+      if (ok) log(`Global shortcut registered: ${acc}`)
+      else logErr(`Global shortcut ${acc} could not be registered (already in use?)`)
+    }
+    hotkeyStatus[key] = ok
+  }
+  if (!hotkeyStatus.hotkeyDictate) {
+    updateTrayLabel(tr('tray.hotkeyUnavailable', { hotkey: formatAccelerator(hotkeyFor('hotkeyDictate')) }))
+  }
+}
+
+// Change one hotkey. Rolls back (and reports why) if the new combo can't be
+// registered, so the user is never left without a working dictation hotkey.
+/** @returns {string | null} error code */
+function setHotkey(key, acc) {
+  if (typeof acc !== 'string' || acc.length > 60) return 'invalid'
+  if (key === 'hotkeyDictate' && !acc) return 'invalid'
+  const other = key === 'hotkeyDictate' ? 'hotkeyAi' : 'hotkeyDictate'
+  if (acc && acc === hotkeyFor(other)) return 'duplicate'
+  const prev = hotkeyFor(key)
+  store.set(key, acc)
+  registerHotkeys()
+  if (acc && !hotkeyStatus[key]) {
+    store.set(key, prev)
+    registerHotkeys()
+    return 'inUse'
+  }
+  if (hotkeyStatus.hotkeyDictate) updateTrayLabel(null)
+  log(`Hotkey ${key} set: ${acc || '(disabled)'}`)
+  return null
+}
 
 // Toggles recording. Registered via Electron's globalShortcut, which uses the OS
 // hot-key API (Carbon RegisterEventHotKey on macOS, RegisterHotKey on Windows).
 // Unlike a global keyboard hook (uiohook/CGEventTap), this never sits in the
 // system-wide input delivery path, so it can't freeze keyboard/mouse input for
-// the whole machine. `summarizeMode` (from ⌥⇧Space) is captured at start and
-// makes 'dictation-chunk' summarize the transcript before pasting.
+// the whole machine. `summarizeMode` (from the AI hotkey) is captured at start
+// and makes the finalize step run the AI action before pasting.
 function toggleRecording(summarizeMode = false) {
   // globalShortcut can fire repeatedly while the combo is held (OS key auto-
   // repeat). Debounce so a brief hold doesn't rapidly flip start/stop.
@@ -1093,7 +1495,8 @@ function toggleRecording(summarizeMode = false) {
     liveSessions.set(id, {
       text: '',
       summarizeMode,
-      language: /** @type {string} */ (store.get('language', 'german')),
+      language: transcriptionLanguage(),
+      detectedLanguage: null,
       tail: Promise.resolve(),
       finalizing: false,
     })
@@ -1110,30 +1513,18 @@ function toggleRecording(summarizeMode = false) {
 }
 
 function setupHotkey() {
-  const ok = globalShortcut.register(HOTKEY_ACCELERATOR, () => toggleRecording(false))
-  if (!ok || !globalShortcut.isRegistered(HOTKEY_ACCELERATOR)) {
-    // Registration fails when another app already owns the combo. The hotkey is
-    // the only way to trigger recording, so surface it rather than fail silently
-    // - but don't block startup (the tray/settings still work).
-    logErr(`Global shortcut ${HOTKEY_ACCELERATOR} could not be registered (already in use)`)
-    updateTrayLabel(tr('tray.hotkeyUnavailable'))
-    dialog.showMessageBox({
-      type: 'warning',
-      title: tr('dialog.hotkey.title'),
-      message: tr('dialog.hotkey.body'),
-    })
-    return
-  }
-  log(`Global shortcut registered: ${HOTKEY_ACCELERATOR}`)
-
-  // Summarize hotkey is optional - if the combo is taken, just log it; plain
-  // dictation still works.
-  const okSum = globalShortcut.register(HOTKEY_SUMMARIZE, () => toggleRecording(true))
-  if (okSum && globalShortcut.isRegistered(HOTKEY_SUMMARIZE)) {
-    log(`Global shortcut registered: ${HOTKEY_SUMMARIZE}`)
-  } else {
-    logErr(`Global shortcut ${HOTKEY_SUMMARIZE} could not be registered (already in use)`)
-  }
+  registerHotkeys()
+  if (hotkeyStatus.hotkeyDictate) return
+  // The hotkey is the only way to start a dictation, so surface the conflict
+  // (non-blocking) and offer the settings, where another combo can be chosen.
+  dialog.showMessageBox({
+    type: 'warning',
+    title: tr('dialog.hotkey.title'),
+    message: tr('dialog.hotkey.body', { hotkey: formatAccelerator(hotkeyFor('hotkeyDictate')) }),
+    buttons: [tr('dialog.hotkey.openSettings'), tr('dialog.ok')],
+    defaultId: 0,
+    cancelId: 1,
+  }).then(({ response }) => { if (response === 0) openSettings() })
 }
 
 // nut-js simulates ⌘V/Ctrl+V to paste the transcript (see 'dictation-chunk'). On
@@ -1158,7 +1549,9 @@ function checkAccessibilityForPaste() {
 
 // ── App Lifecycle ─────────────────────────────────────────────────────────────
 
-app.commandLine.appendSwitch('disable-features', 'AutofillServerCommunication')
+// (The e2e run's fake microphone can't read its WAV from inside the sandboxed
+// out-of-process audio service - run that service in-process there.)
+app.commandLine.appendSwitch('disable-features', e2eAudio ? 'AutofillServerCommunication,AudioServiceOutOfProcess' : 'AutofillServerCommunication')
 // Wayland has no global key grabs; Electron routes globalShortcut through the
 // xdg-desktop-portal GlobalShortcuts API when this is on (no-op under X11).
 if (process.platform === 'linux') app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal')
@@ -1166,7 +1559,7 @@ if (process.platform === 'linux') app.commandLine.appendSwitch('enable-features'
 // One instance only: a second one (autostart + a manual launch) would add a
 // second tray icon and fail to register the hotkeys. Bring up the settings of
 // the running instance instead, so the click visibly did something.
-const gotInstanceLock = isSmokeTest || app.requestSingleInstanceLock()
+const gotInstanceLock = isSmokeTest || !!e2eAudio || app.requestSingleInstanceLock()
 if (!gotInstanceLock) {
   app.exit(0)
 } else {
@@ -1193,6 +1586,37 @@ async function runSmokeTest() {
   }
 }
 
+// Length of a PCM WAV in seconds (from its header), for the e2e run.
+function wavDurationSeconds(file) {
+  const buf = fs.readFileSync(file)
+  const byteRate = buf.readUInt32LE(28)
+  let off = 12
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4)
+    const size = buf.readUInt32LE(off + 4)
+    if (id === 'data') return size / byteRate
+    off += 8 + size + (size % 2)
+  }
+  throw new Error('no data chunk in WAV')
+}
+
+async function runE2E() {
+  const audio = /** @type {string} */ (e2eAudio)
+  setTimeout(() => { console.error('E2E FAIL: timeout'); app.exit(1) }, 300_000)
+  createTray()
+  createOverlay()
+  spawnWorker()
+  if (process.env.SHOWHISPER_E2E_LANGUAGE) store.set('language', process.env.SHOWHISPER_E2E_LANGUAGE)
+  const model = process.env.SHOWHISPER_E2E_MODEL || 'tiny'
+  if (!(await loadModel(model))) { console.error('E2E FAIL: model load'); app.exit(1); return }
+  while (!overlayReady) await new Promise((r) => setTimeout(r, 100))
+  const seconds = wavDurationSeconds(audio)
+  log(`E2E: recording ${seconds.toFixed(1)}s of ${path.basename(audio)} with ${model}`)
+  toggleRecording(false)
+  await new Promise((r) => setTimeout(r, seconds * 1000 + 800))
+  toggleRecording(false) // finalizeDictation prints the transcript and exits
+}
+
 app.whenReady().then(async () => {
   if (!gotInstanceLock) return
   if (isSmokeTest) { await runSmokeTest(); return }
@@ -1206,19 +1630,54 @@ app.whenReady().then(async () => {
   // lingers in the store.
   for (const key of ['provider', 'hfToken', 'hfTokenEnc']) store.delete(key)
 
-  log(`SHOWhisper starting (isDev=${isDev})`)
+  if (e2eAudio) { await runE2E(); return }
+  log(`SHOWhisper ${app.getVersion()} starting (isDev=${isDev}, ${process.platform} ${process.arch})`)
   log(`userData: ${app.getPath('userData')}`)
   log(`Log file: ${elog.transports.file.getFile()?.path}`)
+  cleanupPartialDownloads()
+
+  // Fresh install: language defaults from the OS locale, and the first-run
+  // setup chooses (and downloads) the model. Installs from before the setup
+  // existed already have a model - they skip it.
+  if (!store.has('language')) store.set('language', defaultsForLocale(app.getLocale()).language)
+  if (!store.has('onboarded')) store.set('onboarded', store.has('model'))
+  const firstRun = store.get('onboarded') !== true
+
   createTray()
   createOverlay()
   spawnWorker()
-  checkAccessibilityForPaste()
   setupHotkey()
+  if (firstRun) {
+    openOnboarding()
+    return
+  }
+  checkAccessibilityForPaste()
 
   let savedModel = /** @type {string} */ (store.get('model', 'small'))
   if (!MODELS.includes(savedModel)) savedModel = 'small' // migration: large-v3 → large
   await loadModel(savedModel)
 })
+
+// transformers.js downloads into `<file>.tmp.<pid>.<rand>` and renames when
+// complete. A download interrupted by a crash/quit leaves that temp file
+// behind forever - observed: ~1 GB of orphans in one cache. At startup no
+// download can be running yet, so every such file is garbage.
+function cleanupPartialDownloads() {
+  let freed = 0
+  const walk = (dir) => {
+    let entries
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      const full = path.join(dir, e.name)
+      if (e.isDirectory()) walk(full)
+      else if (/\.tmp\.\d+\.\w+$/.test(e.name)) {
+        try { freed += fs.statSync(full).size; fs.rmSync(full, { force: true }) } catch { /* in use / gone */ }
+      }
+    }
+  }
+  walk(MODEL_CACHE_DIR)
+  if (freed > 0) log(`Removed partial downloads: ${Math.round(freed / 1e6)} MB`)
+}
 
 // Electron types this listener as () => void; the running app does receive an
 // event, so keep calling preventDefault to keep the tray app alive.

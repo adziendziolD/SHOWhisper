@@ -55,6 +55,66 @@
 
     select option { background: #1e1e22; }
 
+    textarea {
+      width: 100%;
+      min-height: 70px;
+      padding: 8px 10px;
+      background: #1e1e22;
+      border: 1px solid #2e2e34;
+      border-radius: 8px;
+      color: #e8e8ea;
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      resize: vertical;
+      outline: none;
+    }
+    textarea:focus { border-color: #5b5bd6; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .row > select { flex: 1; }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #e8e8ea;
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 400;
+      cursor: pointer;
+      margin-bottom: 0;
+    }
+    .check input { accent-color: #5b5bd6; }
+
+    .hotkey {
+      flex: 1;
+      text-align: left;
+      background: #1e1e22;
+      border: 1px solid #2e2e34;
+      color: #e8e8ea;
+      font-weight: 500;
+    }
+    .hotkey.recording { border-color: #5b5bd6; color: #a5a5f0; }
+    .small-btn {
+      padding: 6px 10px;
+      font-size: 11px;
+      background: #2e2e34;
+      color: #e8e8ea;
+    }
+    .error { color: #f87171; }
+    .warn { color: #fbbf24; }
+
+    #version {
+      margin-top: 16px;
+      font-size: 11px;
+      color: #444;
+      text-align: center;
+    }
+
     .hint {
       margin-top: 5px;
       font-size: 11px;
@@ -222,13 +282,70 @@
 
   <div class="field">
     <label data-i18n="settings.language.label">Transkriptions-Sprache</label>
-    <select id="language">
+    <select id="language"></select>
+    <p class="hint"><span data-i18n="settings.language.hint">Sprache, in der du sprichst und die transkribiert wird.</span> <span id="lang-status"></span></p>
+  </div>
+
+  <div class="field">
+    <label data-i18n="settings.uiLanguage.label">App-Sprache</label>
+    <select id="ui-language">
       <option value="german" data-i18n="lang.german">Deutsch</option>
       <option value="english" data-i18n="lang.english">Englisch</option>
       <option value="french" data-i18n="lang.french">Französisch</option>
     </select>
-    <p class="hint"><span data-i18n="settings.language.hint">Sprache, in der du sprichst und die transkribiert wird.</span> <span id="lang-status"></span></p>
   </div>
+
+  <div class="divider"></div>
+
+  <div class="field">
+    <label data-i18n="settings.hotkeyDictate.label">Tastenkürzel Diktat</label>
+    <div class="row">
+      <button id="hk-hotkeyDictate" class="hotkey" data-key="hotkeyDictate"></button>
+    </div>
+  </div>
+
+  <div class="field">
+    <label data-i18n="settings.hotkeyAi.label">Tastenkürzel KI-Aktion</label>
+    <div class="row">
+      <button id="hk-hotkeyAi" class="hotkey" data-key="hotkeyAi"></button>
+      <button id="hk-ai-off" class="small-btn" data-i18n="settings.hotkey.disable">Aus</button>
+    </div>
+    <p class="hint"><span data-i18n="settings.hotkey.hint">Klicken und neue Kombination drücken (Esc bricht ab).</span> <span id="hk-status"></span></p>
+  </div>
+
+  <div class="field">
+    <label data-i18n="settings.aiMode.label">KI-Aktion</label>
+    <select id="ai-mode"></select>
+    <p class="hint" data-i18n="settings.aiMode.hint">Was mit dem Diktat passiert, wenn du es mit dem KI-Tastenkürzel aufnimmst. Läuft lokal.</p>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="field">
+    <label class="check"><input type="checkbox" id="voice-commands"> <span data-i18n="settings.voiceCommands.label">Sprachbefehle („neue Zeile", „neuer Absatz")</span></label>
+  </div>
+
+  <div class="field">
+    <label data-i18n="settings.replacements.label">Ersetzungen / eigenes Vokabular</label>
+    <textarea id="replacements" spellcheck="false" placeholder="show whisper => SHOWhisper"></textarea>
+    <p class="hint"><span data-i18n="settings.replacements.hint">Eine Regel pro Zeile: gehört => richtig. Ganze Wörter, Groß-/Kleinschreibung egal.</span> <span id="repl-status"></span></p>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="field">
+    <label class="check"><input type="checkbox" id="gpu"> <span data-i18n="settings.gpu.label">GPU-Beschleunigung</span></label>
+    <p class="hint" id="gpu-status"></p>
+  </div>
+
+  <div class="field">
+    <div class="row">
+      <label class="check" style="flex:1"><input type="checkbox" id="history"> <span data-i18n="settings.history.label">Verlauf der letzten Diktate (Tray-Menü)</span></label>
+      <button id="btn-clear-history" class="small-btn" data-i18n="settings.history.clear">Leeren</button>
+    </div>
+  </div>
+
+  <div class="divider"></div>
 
   <div id="progress-section">
     <div id="progress-label" data-i18n="overlay.loading">Modell wird geladen…</div>
@@ -254,6 +371,8 @@
     <div id="cache-list" class="cache-list"></div>
   </div>
 
+  <div id="version"></div>
+
   <script>
     let currentLang = 'german'
     const T = (key, vars) => window.i18n.t(currentLang, key, vars)
@@ -274,12 +393,150 @@
       })
     }
 
+    /** @type {any} */
+    let S = null   // settings snapshot from main ('settings-get')
+
     async function init() {
-      const lang = await window.settings.getLanguage()
-      applyI18n(lang || 'german')
-      document.getElementById('language').value = lang || 'german'
+      S = await window.settings.get()
+      applyI18n(S.uiLanguage)
+      render()
       refreshCache()
     }
+
+    function flash(id, text, isError) {
+      const el = document.getElementById(id)
+      el.textContent = text
+      el.style.color = isError ? '#f87171' : '#4ade80'
+      if (!isError) setTimeout(() => { if (el.textContent === text) el.textContent = '' }, 1500)
+    }
+
+    async function save(key, value, statusId) {
+      const res = await window.settings.set(key, value)
+      S = res.settings
+      if (res.error) flash(statusId, T(`settings.error.${res.error}`), true)
+      else if (statusId) flash(statusId, T('status.saved'))
+      render()
+      return !res.error
+    }
+
+    // Fill every control from the snapshot S (also after each change, since
+    // main may have normalized or rejected a value).
+    function render() {
+      const names = new Intl.DisplayNames([S.uiLanguage === 'german' ? 'de' : S.uiLanguage === 'french' ? 'fr' : 'en'], { type: 'language' })
+      const lang = document.getElementById('language')
+      lang.innerHTML = ''
+      const options = Object.entries(S.languages)
+        .map(([name, code]) => ({ value: name, label: names.of(code) || name }))
+        .sort((a, b) => a.label.localeCompare(b.label))
+      for (const o of [{ value: 'auto', label: T('settings.language.auto') }, ...options]) {
+        const el = document.createElement('option')
+        el.value = o.value
+        el.textContent = o.label
+        lang.appendChild(el)
+      }
+      lang.value = S.language
+      document.getElementById('ui-language').value = S.uiLanguage
+
+      for (const key of ['hotkeyDictate', 'hotkeyAi']) {
+        const btn = document.getElementById(`hk-${key}`)
+        if (btn.classList.contains('recording')) continue
+        const label = S[`${key}Label`]
+        btn.textContent = label || T('settings.hotkey.off')
+        btn.classList.toggle('error', !!S[key] && !S.hotkeyStatus[key])
+        btn.title = S[key] && !S.hotkeyStatus[key] ? T('settings.error.inUse') : ''
+      }
+
+      const mode = document.getElementById('ai-mode')
+      mode.innerHTML = ''
+      for (const m of S.aiModes) {
+        const el = document.createElement('option')
+        el.value = m
+        el.textContent = T(`settings.aiMode.${m}`)
+        mode.appendChild(el)
+      }
+      mode.value = S.aiMode
+
+      document.getElementById('voice-commands').checked = S.voiceCommands
+      const repl = document.getElementById('replacements')
+      if (document.activeElement !== repl) repl.value = S.replacements
+      document.getElementById('gpu').checked = S.gpu
+      const gpuStatus = document.getElementById('gpu-status')
+      gpuStatus.className = 'hint' + (S.gpuAutoDisabled ? ' warn' : '')
+      gpuStatus.textContent = S.gpuAutoDisabled
+        ? T('settings.gpu.autoDisabled')
+        : T('settings.gpu.device', { device: T(`settings.gpu.device.${S.device}`) })
+      document.getElementById('history').checked = S.history
+      document.getElementById('version').textContent = `SHOWhisper ${S.version}`
+    }
+
+    // ── Hotkey capture ────────────────────────────────────────────────────────
+    // Build an Electron accelerator from the physical key (e.code), so ⌥+key
+    // on macOS doesn't turn into a special character, and any keyboard layout
+    // records the same combo.
+    const CODE_KEYS = {
+      Space: 'Space', Enter: 'Enter', Tab: 'Tab', Backspace: 'Backspace', Delete: 'Delete',
+      Insert: 'Insert', Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
+      ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+      Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Semicolon: ';', Quote: "'",
+      Comma: ',', Period: '.', Slash: '/', Backslash: '\\', Backquote: '`',
+    }
+    function acceleratorFromEvent(e) {
+      let key = CODE_KEYS[e.code]
+      if (!key) {
+        const m = e.code.match(/^Key([A-Z])$/) || e.code.match(/^Digit(\d)$/) || e.code.match(/^(F\d{1,2})$/)
+        if (m) key = m[1]
+      }
+      if (!key) return null // modifier alone or unsupported key
+      const mods = []
+      if (e.ctrlKey) mods.push('Control')
+      if (e.metaKey) mods.push(S.platform === 'darwin' ? 'Command' : 'Super')
+      if (e.altKey) mods.push('Alt')
+      if (e.shiftKey) mods.push('Shift')
+      // A plain letter as a global hotkey would swallow that letter everywhere.
+      if (mods.length === 0 && !/^F\d/.test(key)) return null
+      return [...mods, key].join('+')
+    }
+
+    let recordingKey = null
+    function stopCapture() {
+      if (!recordingKey) return
+      document.getElementById(`hk-${recordingKey}`).classList.remove('recording')
+      recordingKey = null
+      window.settings.suspendHotkeys(false)
+      render()
+    }
+    for (const key of ['hotkeyDictate', 'hotkeyAi']) {
+      document.getElementById(`hk-${key}`).addEventListener('click', () => {
+        stopCapture()
+        recordingKey = key
+        const btn = document.getElementById(`hk-${key}`)
+        btn.classList.add('recording')
+        btn.textContent = T('settings.hotkey.press')
+        window.settings.suspendHotkeys(true)
+      })
+    }
+    window.addEventListener('keydown', async (e) => {
+      if (!recordingKey) return
+      e.preventDefault()
+      if (e.key === 'Escape') { stopCapture(); return }
+      const acc = acceleratorFromEvent(e)
+      if (!acc) return
+      const key = recordingKey
+      document.getElementById(`hk-${key}`).classList.remove('recording')
+      recordingKey = null
+      await save(key, acc, 'hk-status') // re-registers both hotkeys in main
+    })
+    window.addEventListener('blur', stopCapture)
+    document.getElementById('hk-ai-off').addEventListener('click', () => { stopCapture(); save('hotkeyAi', '', 'hk-status') })
+
+    document.getElementById('ui-language').addEventListener('change', (e) => save('uiLanguage', e.target.value))
+    document.getElementById('ai-mode').addEventListener('change', (e) => save('aiMode', e.target.value))
+    document.getElementById('voice-commands').addEventListener('change', (e) => save('voiceCommands', e.target.checked))
+    document.getElementById('gpu').addEventListener('change', (e) => save('gpu', e.target.checked))
+    document.getElementById('history').addEventListener('change', (e) => save('history', e.target.checked))
+    document.getElementById('btn-clear-history').addEventListener('click', () => window.settings.clearHistory())
+    // Saved when the field loses focus (not per keystroke - each save re-parses).
+    document.getElementById('replacements').addEventListener('change', (e) => save('replacements', e.target.value, 'repl-status'))
 
     // ── Model cache ───────────────────────────────────────────────────────────
     function formatBytes(n) {
@@ -362,6 +619,7 @@
         pct.textContent    = '100%'
         status.textContent = T('status.modelLoaded')
         refreshCache() // show the freshly loaded model in the cache list
+        window.settings.get().then((snap) => { S = snap; render() }) // device may have changed
         // Clear the transient status/progress after a moment; the settings
         // window stays open (a download here is triggered from the tray menu,
         // not by this window).
@@ -376,20 +634,13 @@
     })
 
     // Language is saved instantly on change (no model reload needed).
-    document.getElementById('language').addEventListener('change', (e) => {
-      window.settings.setLanguage(e.target.value)
-      applyI18n(e.target.value)   // switch the whole settings UI immediately
-      refreshCache()              // re-render the cache list in the new language
-      const s = document.getElementById('lang-status')
-      s.textContent = T('status.saved')
-      s.style.color = '#4ade80'
-      setTimeout(() => { s.textContent = '' }, 1500)
-    })
+    document.getElementById('language').addEventListener('change', (e) => save('language', e.target.value, 'lang-status'))
 
-    // Also react if the language is changed elsewhere.
-    window.settings.onLanguageChanged((lang) => {
-      document.getElementById('language').value = lang
+    // The UI language changed (here or elsewhere): re-localize everything.
+    window.settings.onLanguageChanged(async (lang) => {
+      S = await window.settings.get()
       applyI18n(lang)
+      render()
       refreshCache()
     })
 

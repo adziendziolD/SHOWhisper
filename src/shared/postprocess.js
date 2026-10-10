@@ -6,6 +6,34 @@
 // 'english', ...). 'auto' (language detection) applies the commands of every
 // language that has some.
 
+const { applyDictationMarkers, MARKERS } = require('./dictation')
+
+/**
+ * Quote markers (dictation.js) for a known language; with 'auto' (or a
+ * detected language without markers of its own) every marker set is tried.
+ * @param {string} text
+ * @param {string | null | undefined} language
+ * @returns {string}
+ */
+function applyMarkersFor(text, language) {
+  if (language && Object.prototype.hasOwnProperty.call(MARKERS, language)) return applyDictationMarkers(text, language)
+  if (language && language !== 'auto') return text
+  return Object.keys(MARKERS).reduce((t, lang) => applyDictationMarkers(t, lang), text)
+}
+
+/**
+ * The full post-processing of a finished dictation: quote markers → spoken
+ * layout commands → the user's replacements (last, so they can fix anything).
+ * @param {string} text
+ * @param {{ language: string, voiceCommands?: boolean, replacements?: Replacement[] | null }} opts
+ * @returns {string}
+ */
+function postprocessDictation(text, { language, voiceCommands = true, replacements = null }) {
+  let out = applyMarkersFor(text, language)
+  if (voiceCommands) out = applyVoiceCommands(out, language)
+  return applyReplacements(out, replacements)
+}
+
 // Spoken layout commands per language. Whisper usually wraps them in
 // punctuation ("Hallo, neue Zeile, wie geht's"), so a comma right before and
 // any punctuation right after the phrase are swallowed with it.
@@ -116,4 +144,7 @@ function formatReplacements(list) {
   return (Array.isArray(list) ? list : []).map((r) => `${r.from} => ${r.to}`).join('\n')
 }
 
-module.exports = { applyVoiceCommands, applyReplacements, parseReplacements, formatReplacements, VOICE_COMMANDS }
+module.exports = {
+  postprocessDictation, applyMarkersFor, applyVoiceCommands, applyReplacements,
+  parseReplacements, formatReplacements, VOICE_COMMANDS,
+}
