@@ -1,7 +1,7 @@
 {
   "name": "showhisper",
   "version": "0.6.0",
-  "description": "Local, private Whisper dictation app for macOS & Windows — menubar app with a floating pill overlay and global hotkey.",
+  "description": "Local, private Whisper dictation app for macOS, Windows & Linux — tray app with a floating pill overlay and global hotkey.",
   "main": "src/main/main.js",
   "author": "Adziendz",
   "license": "MIT",
