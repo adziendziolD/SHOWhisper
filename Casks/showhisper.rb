@@ -7,10 +7,10 @@
 # .github/workflows/build.yml after each tagged release. (0.6.1 still uses the
 # old "-arm64.dmg" asset name; releases from then on are "-mac-arm64.dmg".)
 cask "showhisper" do
-  version "0.6.1"
-  sha256 "03a7a80bffb2b0c89b4c87e5ff931db17151c01a24bd812a42470c50787f74d1"
+  version "0.7.0"
+  sha256 "0f86444c58c6b51ae80b2b4f8fd2573c41f6745587f955a96fe3220dabe3ab06"
 
-  url "https://github.com/adziendziolD/SHOWhisper/releases/download/v#{version}/SHOWhisper-#{version}-arm64.dmg"
+  url "https://github.com/adziendziolD/SHOWhisper/releases/download/v#{version}/SHOWhisper-#{version}-mac-arm64.dmg"
   name "SHOWhisper"
   desc "Local, private Whisper dictation in the menu bar"
   homepage "https://github.com/adziendziolD/SHOWhisper"
