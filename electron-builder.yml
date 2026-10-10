@@ -19,18 +19,87 @@ mac:
   # keeps each CI runner building only its own architecture, so the native
   # prebuilds (onnxruntime-node, nut-js are fetched per host arch)
   # match the target instead of shipping arm64 binaries inside an x64 dmg.
+  # Apple Silicon only: onnxruntime-node (pinned 1.24.3) ships no darwin/x64
+  # prebuild, so an Intel build could not load Whisper.
   target:
     - dmg
   category: public.app-category.productivity
+
+dmg:
+  artifactName: ${productName}-${version}-mac-${arch}.${ext}
 
 win:
   icon: assets/icon.ico
   target:
     - target: nsis
 
+nsis:
+  artifactName: ${productName}-${version}-windows-${arch}-setup.${ext}
+
+linux:
+  icon: assets/icon.png
+  # Explicit, lowercase, space-free binary name (CI smoke test runs
+  # dist/linux-unpacked/showhisper; also used for the .desktop Exec line).
+  executableName: showhisper
+  category: Utility
+  synopsis: Local, private Whisper dictation
+  description: >-
+    Press a hotkey, speak, and your words are transcribed on-device with
+    Whisper and pasted into whatever app you're in. Fully offline.
+  maintainer: adziendziolD <adziendziolD@users.noreply.github.com>
+  vendor: Adziendz
+  # Only x64: CI builds on an x64 runner, and the native prebuilds
+  # (node-llama-cpp, libnut, ffmpeg-static) are fetched for the host arch.
+  target:
+    - target: AppImage
+      arch: x64
+    - target: deb
+      arch: x64
+  # node-llama-cpp's CUDA prebuilds (@node-llama-cpp/linux-x64-cuda*, ~550 MB
+  # unpacked) would bloat the AppImage/deb enormously. Drop them; node-llama-cpp
+  # then falls back to its Vulkan or CPU build. (Merged with root `files`.)
+  files:
+    - "!**/node_modules/@node-llama-cpp/linux-x64-cuda/**"
+    - "!**/node_modules/@node-llama-cpp/linux-x64-cuda-ext/**"
+
+appImage:
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
+
+deb:
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
+  # Replaces electron-builder's default list, so it repeats Electron's own
+  # runtime deps plus libX11 + libXtst, the only extra libs libnut.node (the
+  # nut-js paste simulation) links against, and ALSA for microphone capture.
+  # The `|` alternatives cover Ubuntu 24.04's t64 package renames.
+  depends:
+    - libgtk-3-0 | libgtk-3-0t64
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - libx11-6
+    - libasound2 | libasound2t64
+    - xdg-utils
+    - libatspi2.0-0 | libatspi2.0-0t64
+    - libuuid1
+    - libsecret-1-0
+
+# Generates latest.yml / latest-linux.yml (+ app-update.yml inside the app)
+# for electron-updater. CI builds with --publish never and the release job
+# uploads the files itself (see .github/workflows/build.yml).
+publish:
+  provider: github
+  owner: adziendziolD
+  repo: SHOWhisper
+  releaseType: release
+
 files:
   - "**/*"
   - "!node_modules/electron-builder/**"
+  # Repo-only content (Homebrew cask, install scripts, docs) - not app code.
+  - "!Casks/**"
+  - "!scripts/**"
+  - "!docs/**"
 
 asar: true
 # Native modules must be unpacked from the asar archive, otherwise the loader
