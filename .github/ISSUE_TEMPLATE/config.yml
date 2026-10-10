@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Download the latest release
+    url: https://github.com/adziendziolD/SHOWhisper/releases/latest
+    about: Installers for macOS (Apple Silicon), Windows and Linux.
+  - name: Installation & troubleshooting
+    url: https://github.com/adziendziolD/SHOWhisper#install
+    about: Gatekeeper / SmartScreen prompts, permissions, Linux notes — check the README first.

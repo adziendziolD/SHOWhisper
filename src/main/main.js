@@ -1647,6 +1647,7 @@ app.whenReady().then(async () => {
   createOverlay()
   spawnWorker()
   setupHotkey()
+  require('./updater').setupAutoUpdate({ log, logErr, tr, isDev, store })
   if (firstRun) {
     openOnboarding()
     return

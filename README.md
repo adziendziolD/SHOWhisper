@@ -1,11 +1,78 @@
 <div align="center">
   <img src="assets/icon.png" alt="SHOWhisper" width="128" height="128" />
   <h1>SHOWhisper</h1>
-  <p><strong>Local, private voice dictation for macOS &amp; Windows.</strong></p>
+  <p><strong>Local, private voice dictation for macOS, Windows &amp; Linux.</strong></p>
   <p>Press a hotkey, speak, and your words are transcribed on-device with Whisper and pasted into whatever app you're in. No cloud, no account, nothing leaves your machine.</p>
+
+  <p>
+    <a href="https://github.com/adziendziolD/SHOWhisper/releases/latest"><img src="https://img.shields.io/badge/%E2%AC%87%EF%B8%8F%20Download-latest%20release-2ea44f?style=for-the-badge" alt="Download the latest release" height="40" /></a>
+  </p>
+
+  <p>
+    <a href="https://github.com/adziendziolD/SHOWhisper/releases/latest"><img src="https://img.shields.io/github/v/release/adziendziolD/SHOWhisper?label=release" alt="Latest release" /></a>
+    <a href="https://github.com/adziendziolD/SHOWhisper/releases"><img src="https://img.shields.io/github/downloads/adziendziolD/SHOWhisper/total?label=downloads" alt="Downloads" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/adziendziolD/SHOWhisper" alt="MIT license" /></a>
+    <img src="https://img.shields.io/badge/platforms-macOS%20(Apple%20Silicon)%20%7C%20Windows%20%7C%20Linux-blue" alt="Platforms: macOS (Apple Silicon), Windows, Linux" />
+  </p>
+
+  <!-- Demo GIF: record it following docs/demo-script.md, save as docs/demo.gif, then uncomment:
+  <img src="docs/demo.gif" alt="SHOWhisper demo: press ⌥Space, speak, the text appears at the cursor" width="720" />
+  -->
 </div>
 
 ---
+
+## Install
+
+**→ [Download the latest release](https://github.com/adziendziolD/SHOWhisper/releases/latest)**, or use one of the one-liners below. All builds are free and open source; they just aren't signed with paid Apple/Microsoft certificates, so the OS asks for confirmation once (the Homebrew cask and install scripts handle that for you on macOS).
+
+### macOS (Apple Silicon, macOS 12+)
+
+| Method | How |
+|--------|-----|
+| **Homebrew** (recommended) | `brew tap adziendziolD/showhisper https://github.com/adziendziolD/SHOWhisper && brew install --cask showhisper` |
+| Install script | `curl -fsSL https://raw.githubusercontent.com/adziendziolD/SHOWhisper/main/scripts/install-mac.sh \| bash` |
+| Manual | Download `SHOWhisper-<version>-mac-arm64.dmg`, drag **SHOWhisper** into **Applications**, then follow the [Gatekeeper steps](#installing-the-app-manually-macos-dmg) below. |
+
+> Intel Macs are **not supported**: the ONNX runtime used for Whisper (`onnxruntime-node`) ships no Intel macOS build.
+
+### Windows (10/11, x64)
+
+| Method | How |
+|--------|-----|
+| **Installer** | Download and run `SHOWhisper-<version>-windows-x64-setup.exe`. |
+| PowerShell one-liner | `irm https://raw.githubusercontent.com/adziendziolD/SHOWhisper/main/scripts/install-windows.ps1 \| iex` |
+
+The installer is per-user (no admin rights). SmartScreen may show *"Windows protected your PC"* because the build isn't signed with a paid certificate — click **More info → Run anyway**.
+
+### Linux (x86_64)
+
+| Method | How |
+|--------|-----|
+| **AppImage** (any distro, auto-updates) | `curl -fsSL https://raw.githubusercontent.com/adziendziolD/SHOWhisper/main/scripts/install-linux.sh \| bash` — or download `SHOWhisper-<version>-linux-x86_64.AppImage`, `chmod +x` it and run it. |
+| **.deb** (Debian/Ubuntu) | Download `SHOWhisper-<version>-linux-amd64.deb`, then `sudo apt install ./SHOWhisper-<version>-linux-amd64.deb`. |
+
+Honest notes for Linux:
+
+- **X11:** the global hotkey and auto-paste work as on the other platforms.
+- **Wayland:** the global hotkey goes through the desktop's *GlobalShortcuts* portal (your desktop may ask you to confirm the shortcut). Auto-paste (simulated <kbd>Ctrl</kbd>+<kbd>V</kbd>) may only work in XWayland apps — otherwise the text simply stays on the clipboard for a manual paste.
+- <kbd>Alt</kbd>+<kbd>Space</kbd> is bound to the window menu on GNOME and KDE by default; free it in your keyboard settings if the hotkey doesn't trigger.
+- GNOME needs the *AppIndicator* extension (preinstalled on Ubuntu) to show tray icons.
+- AppImages need FUSE 2: `sudo apt install libfuse2t64` (Ubuntu 24.04+) or `libfuse2` (older).
+
+### After installing
+
+Grant **Microphone** access (and on macOS **Accessibility** for auto-paste — see [Permissions](#permissions-macos)). The Whisper model (default `small`, ~450 MB) downloads on first launch; after that everything runs offline.
+
+## Updating
+
+| Platform | How updates arrive |
+|----------|--------------------|
+| **Windows**, **Linux AppImage** | Automatic: SHOWhisper checks for updates in the background, downloads them and asks to restart (or installs on the next quit). |
+| **macOS** | You get a notification with a link to the new release. With Homebrew, run `brew upgrade --cask showhisper`; with the install script, simply run it again. |
+| **Linux .deb** | You get a notification with a link to the new release; install the new `.deb` the same way. |
+
+Update checks are a single anonymous request to GitHub for the latest release — nothing about you or your dictations is sent. Dismissing an update with **Later** keeps it quiet until the next version.
 
 ## Features
 
@@ -49,7 +116,7 @@ Files can use a **different (larger) Whisper model** than live dictation — pic
 
 ## Hotkeys
 
-Both hotkeys are global (work in any app) and toggle: press once to start recording, press again to stop. On macOS <kbd>⌥</kbd> is Option; on Windows it's <kbd>Alt</kbd>.
+Both hotkeys are global (work in any app) and toggle: press once to start recording, press again to stop. On macOS <kbd>⌥</kbd> is Option; on Windows and Linux it's <kbd>Alt</kbd>.
 
 | Hotkey | Action |
 |--------|--------|
@@ -72,8 +139,8 @@ The <kbd>⌥</kbd> <kbd>Space</kbd> toggle is registered through Electron's buil
 
 ## Requirements
 
-- macOS 12+ (Apple Silicon or Intel) or Windows 10/11
-- [Node.js](https://nodejs.org/) 18+ and npm (for building from source)
+- macOS 12+ on **Apple Silicon** (M1 or newer — Intel Macs aren't supported), Windows 10/11 (x64), or Linux x86_64 (X11 recommended, see the [Linux notes](#linux-x86_64))
+- [Node.js](https://nodejs.org/) 22+ and npm (for building from source)
 
 ### Permissions (macOS)
 
@@ -84,11 +151,13 @@ On first launch macOS will ask for these permissions:
 | **Microphone** | recording your voice (required) | System Settings → Privacy & Security → Microphone |
 | **Accessibility** | simulated paste of the transcript (optional: without it the text stays on the clipboard for a manual paste) | System Settings → Privacy & Security → Accessibility |
 
-## Installing the app (macOS `.dmg`)
+## Installing the app manually (macOS `.dmg`)
+
+> Using Homebrew or the install script? Then you can skip this section — both remove the quarantine flag for you, so the app opens without any prompt.
 
 The `.dmg` is **ad-hoc signed but not notarized** (building a notarized release needs a paid Apple Developer account). It runs perfectly fine, but macOS Gatekeeper shows a warning on the very first launch that you have to click past **once**. This is expected — follow the steps below.
 
-1. **Download** `SHOWhisper-<version>-<arch>.dmg`. Pick `arm64` for Apple Silicon (M1/M2/M3/M4) or `x64` for Intel Macs.
+1. **Download** `SHOWhisper-<version>-mac-arm64.dmg` (Apple Silicon — M1/M2/M3/M4 or newer).
 2. **Open the `.dmg`** and drag **SHOWhisper** into your **Applications** folder.
 3. **First launch — get past Gatekeeper.** Double-clicking will say *"SHOWhisper cannot be opened because Apple cannot check it for malicious software"* (or *"is damaged"* on Apple Silicon). Do **one** of these once:
    - **Right-click** (or Control-click) the app in Applications → **Open** → **Open** in the dialog, **or**
@@ -100,10 +169,6 @@ The `.dmg` is **ad-hoc signed but not notarized** (building a notarized release 
 5. **First use downloads the models.** The Whisper model (default `small`, ~450 MB) downloads on first launch; the summarization model (~2.5 GB) downloads the first time you use <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>Space</kbd>. Both are cached locally and afterwards everything runs offline.
 
 > **Why the warning?** Ad-hoc signing is what avoids the harder "app is damaged" rejection on Apple Silicon, but only full notarization removes the prompt entirely. The app is open source — you can also build it yourself (below).
-
-### Windows (`.exe`)
-
-Run the NSIS installer. SmartScreen may show *"Windows protected your PC"* because the build isn't signed with a paid certificate — click **More info → Run anyway**.
 
 ## Getting started (from source)
 
@@ -138,7 +203,17 @@ Default: `small`. Models are loaded from the public [`Xenova`](https://huggingfa
 npm run build
 ```
 
-Output lands in `dist/` (`.dmg` on macOS, NSIS `.exe` on Windows). Native modules are unpacked from the asar archive automatically (see `electron-builder.yml`).
+Output lands in `dist/`: `.dmg` on macOS, NSIS `.exe` on Windows, `.AppImage` + `.deb` on Linux. Build on the platform you're targeting — the native modules (onnxruntime-node, nut-js/libnut, node-llama-cpp, ffmpeg-static) are installed by `npm install` for the host OS/arch only. Native modules are unpacked from the asar archive automatically (see `electron-builder.yml`).
+
+```bash
+npm run build -- --mac --arm64   # macOS (Apple Silicon)
+npm run build -- --win --x64     # Windows
+npm run build -- --linux --x64   # Linux: AppImage + deb
+```
+
+On Linux, the `.deb` build needs no extra tools (electron-builder downloads `fpm`); running the app needs `libxtst6` and `libx11-6` for auto-paste.
+
+Releases are built by GitHub Actions (`.github/workflows/build.yml`) when a `v*` tag is pushed: every packaged app is smoke-tested (`--smoke-test` loads all native modules), the installers plus the auto-update metadata (`latest*.yml`) are attached to the release, and the Homebrew cask in `Casks/` is bumped automatically. The tag must match the `version` in `package.json`.
 
 > **After building, launch the packaged app once and run the full flow** (hotkey → model load → dictation → paste) — native modules only fully exercise in the packaged build, not just `npm start`.
 
@@ -166,20 +241,21 @@ mac:
 ```bash
 npm run dev     # electron with NODE_ENV=development + devtools + verbose logs
 npm run lint    # eslint
+npm test        # unit tests (node:test)
 ```
 
 Verbose per-token / PCM diagnostics and transcript logging are only emitted in development mode — production builds keep logs minimal and never log the recognized text.
 
 ## Roadmap
 
-- Auto-update via `electron-updater`
 - Transcription history
 - More languages / auto-detect
 - Custom hotkey
+- Linux arm64 builds
 
 ## Tech stack
 
-Electron (built-in `globalShortcut` for the hotkey) · [@huggingface/transformers](https://github.com/huggingface/transformers.js) (Whisper via ONNX) · [@nut-tree-fork/nut-js](https://github.com/nut-tree/nut.js) (paste simulation) · electron-store · electron-builder
+Electron (built-in `globalShortcut` for the hotkey) · [@huggingface/transformers](https://github.com/huggingface/transformers.js) (Whisper via ONNX) · [@nut-tree-fork/nut-js](https://github.com/nut-tree/nut.js) (paste simulation) · electron-store · electron-builder · electron-updater
 
 ## License
 

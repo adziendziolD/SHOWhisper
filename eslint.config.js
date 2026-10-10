@@ -8,6 +8,7 @@ const nodeGlobals = {
   console: 'readonly', Buffer: 'readonly', __dirname: 'readonly', __filename: 'readonly',
   setTimeout: 'readonly', clearTimeout: 'readonly', setInterval: 'readonly',
   clearInterval: 'readonly', fetch: 'readonly', URL: 'readonly', Float32Array: 'readonly',
+  setImmediate: 'readonly', AbortSignal: 'readonly',
 }
 
 const browserGlobals = {

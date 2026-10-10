@@ -1,7 +1,7 @@
 {
   "name": "showhisper",
   "version": "0.6.1",
-  "description": "Local, private Whisper dictation app for macOS & Windows — menubar app with a floating pill overlay and global hotkey.",
+  "description": "Local, private Whisper dictation app for macOS, Windows & Linux — tray app with a floating pill overlay and global hotkey.",
   "main": "src/main/main.js",
   "author": "Adziendz",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "@nut-tree-fork/nut-js": "^4.2.6",
     "electron-log": "^5.4.4",
     "electron-store": "^11.0.2",
+    "electron-updater": "^6.8.9",
     "ffmpeg-static": "^5.3.0",
     "node-llama-cpp": "^3.19.1"
   },

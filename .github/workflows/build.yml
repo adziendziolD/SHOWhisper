@@ -1,28 +1,50 @@
 name: Build
 
-# Builds the macOS DMG (arm64 + x64) and the Windows NSIS installer.
-# Runs on version tags (v*) and on manual dispatch. On a tag, the built
-# installers are attached to a GitHub Release for that tag.
+# Builds the macOS DMG (Apple Silicon), the Windows NSIS installer and the
+# Linux AppImage + deb, smoke-tests each packaged app, and on version tags
+# (v*) publishes them - plus the electron-updater metadata - to a GitHub
+# Release and bumps the Homebrew cask. Also runs on manual dispatch.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
+# One run per ref; a newer manual run supersedes an older one, but tag
+# (release) runs are never cancelled halfway through publishing.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
 jobs:
-  # Fast, platform-independent gate. Keeps the expensive macOS/Windows
-  # build jobs from running when types or lint are broken.
+  # Fast, platform-independent gate. Keeps the expensive build jobs from
+  # running when types, lint or tests are broken.
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
+      - name: Tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          # The artifact names, latest*.yml and the cask all use the
+          # package.json version, while URLs use the tag - they must agree.
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG"
+            exit 1
+          fi
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      - run: npm test --if-present
 
   build:
     needs: check
@@ -30,42 +52,85 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS is arm64-only: the global-hotkey dependency
-          # @mukea/uiohook-napi ships no darwin-x64 prebuild, so an Intel
-          # dmg can't load it. (GitHub's macos-13 Intel runners are also
-          # being retired.) Windows is x64.
+          # macOS is Apple Silicon only: onnxruntime-node (pinned to 1.24.3)
+          # ships no darwin/x64 prebuild, so an Intel build couldn't load
+          # Whisper. Windows and Linux are x64.
           # --publish never: electron-builder auto-publishes to GitHub
           # Releases when it sees a git tag; we publish from the release job
           # below instead, so disable its implicit publishing here.
-          - os: macos-14        # Apple Silicon
+          - os: macos-15        # Apple Silicon
             build: npm run build -- --mac --arm64 --publish never
             artifact: macos-arm64
           - os: windows-latest
-            build: npm run build -- --win --publish never
+            build: npm run build -- --win --x64 --publish never
             artifact: windows-x64
+          - os: ubuntu-latest
+            build: npm run build -- --linux --x64 --publish never
+            artifact: linux-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
+      # npm ci on each runner installs that platform's native prebuilds
+      # (onnxruntime-node, libnut, @node-llama-cpp/<platform>, ffmpeg-static).
       - run: npm ci
       - name: Build installer
         run: ${{ matrix.build }}
         env:
           # No signing certificate in CI: stop electron-builder from trying to
-          # sign with a keychain identity (would fail). Builds an unsigned app.
+          # sign with a keychain identity (would fail). Builds an unsigned
+          # (macOS: ad-hoc signed) app.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
+
+      # Smoke test: launch the packaged (unpacked) app with --smoke-test, which
+      # loads every native module (onnxruntime-node, nut-js, node-llama-cpp,
+      # ffmpeg) inside the real bundle, prints "SMOKE OK" and exits 0.
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          dist/mac-arm64/SHOWhisper.app/Contents/MacOS/SHOWhisper --smoke-test 2>&1 | tee smoke.log
+          grep -q "SMOKE OK" smoke.log
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          # GUI-subsystem exe: Start-Process -Wait to get the real exit code.
+          $p = Start-Process -FilePath "dist\win-unpacked\SHOWhisper.exe" -ArgumentList "--smoke-test" `
+            -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput smoke.out.log -RedirectStandardError smoke.err.log
+          Get-Content smoke.out.log, smoke.err.log -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { Write-Error "Smoke test failed (exit code $($p.ExitCode))"; exit 1 }
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libxtst6 libx11-6 >/dev/null
+          # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor,
+          # which Chromium's sandbox needs when chrome-sandbox isn't setuid
+          # (as in linux-unpacked). Allow them for this runner.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          xvfb-run -a dist/linux-unpacked/showhisper --smoke-test 2>&1 | tee smoke.log
+          grep -q "SMOKE OK" smoke.log
+
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
             dist/*.dmg
             dist/*.exe
+            dist/*.AppImage
+            dist/*.deb
             dist/*.blockmap
             dist/latest*.yml
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   release:
     needs: build
@@ -73,25 +138,114 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # gh resolves the repo from this env; the publish step runs outside a
+      # checkout, so without it gh fails with "not a git repository".
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
+
       - name: Publish release
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # gh resolves the repo from this env; the job has no checkout, so
-          # without it gh fails with "not a git repository".
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # NUL-delimited into an array so installer names with spaces
-          # (e.g. "SHOWhisper Setup 0.3.2.exe") stay a single argument.
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${GH_REPO}/releases/download/${TAG}"
+          RAW="https://raw.githubusercontent.com/${GH_REPO}/main/scripts"
+
+          # Installers + electron-updater metadata (latest.yml for Windows,
+          # latest-linux.yml for the AppImage) and the blockmaps used for
+          # differential downloads. NUL-delimited so odd names stay intact.
           FILES=()
-          while IFS= read -r -d '' f; do FILES+=("$f"); done \
-            < <(find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -print0)
+          while IFS= read -r -d '' f; do FILES+=("$f"); done < <(find artifacts -type f \( \
+            -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' \
+            -o -name '*.blockmap' -o -name 'latest*.yml' \) -print0)
+          if [ "${#FILES[@]}" -eq 0 ]; then echo "::error::No build artifacts found"; exit 1; fi
           printf 'Attaching: %s\n' "${FILES[@]}"
-          gh release create "$TAG" --title "$TAG" --generate-notes || true
+
+          # Release notes: download table + one-liners, then GitHub's
+          # generated notes.
+          cat > notes.md <<EOF
+          ## Download
+
+          | Platform | File |
+          |----------|------|
+          | macOS 12+ (Apple Silicon) | [SHOWhisper-${VERSION}-mac-arm64.dmg](${BASE}/SHOWhisper-${VERSION}-mac-arm64.dmg) |
+          | Windows 10/11 (x64) | [SHOWhisper-${VERSION}-windows-x64-setup.exe](${BASE}/SHOWhisper-${VERSION}-windows-x64-setup.exe) |
+          | Linux x86_64 (any distro) | [SHOWhisper-${VERSION}-linux-x86_64.AppImage](${BASE}/SHOWhisper-${VERSION}-linux-x86_64.AppImage) |
+          | Debian / Ubuntu (amd64) | [SHOWhisper-${VERSION}-linux-amd64.deb](${BASE}/SHOWhisper-${VERSION}-linux-amd64.deb) |
+
+          **One-line install**
+
+          - macOS (Homebrew): \`brew tap adziendziolD/showhisper https://github.com/adziendziolD/SHOWhisper && brew install --cask showhisper\`
+          - macOS (script): \`curl -fsSL ${RAW}/install-mac.sh | bash\`
+          - Linux (AppImage): \`curl -fsSL ${RAW}/install-linux.sh | bash\`
+          - Windows (PowerShell): \`irm ${RAW}/install-windows.ps1 | iex\`
+
+          > **macOS:** the app is ad-hoc signed but not notarized. Homebrew and the install script take care of Gatekeeper; with the plain .dmg, right-click the app → **Open** once (or run \`xattr -cr /Applications/SHOWhisper.app\`). Intel Macs are not supported.
+          >
+          > **Windows:** the installer isn't code-signed, so SmartScreen may warn — click **More info → Run anyway**.
+
+          EOF
+
+          gh api -X POST "repos/${GH_REPO}/releases/generate-notes" -f tag_name="$TAG" --jq .body >> notes.md \
+            || echo "_Generated notes unavailable._" >> notes.md
+
+          PRERELEASE=()
+          if [[ "$TAG" == *-* ]]; then PRERELEASE=(--prerelease); fi
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md ${PRERELEASE[@]+"${PRERELEASE[@]}"} || true
           gh release upload "$TAG" "${FILES[@]}" --clobber
+
+      # Bump Casks/showhisper.rb (version, sha256, url) on the default branch
+      # so `brew upgrade --cask showhisper` picks up the new release.
+      # Skipped for prerelease tags (v1.2.3-beta.1); no-op if unchanged.
+      - uses: actions/checkout@v7
+        if: ${{ !contains(github.ref_name, '-') }}
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: repo
+      - name: Update Homebrew cask
+        if: ${{ !contains(github.ref_name, '-') }}
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          DMG="artifacts/macos-arm64/SHOWhisper-${VERSION}-mac-arm64.dmg"
+          if [ ! -f "$DMG" ]; then
+            echo "::error::$DMG not found"; find artifacts -name '*.dmg'; exit 1
+          fi
+          SHA="$(sha256sum "$DMG" | cut -d' ' -f1)"
+
+          cd repo
+          CASK=Casks/showhisper.rb
+          sed -i -E "s/^  version \".*\"$/  version \"${VERSION}\"/" "$CASK"
+          sed -i -E "s/^  sha256 .*$/  sha256 \"${SHA}\"/" "$CASK"
+          sed -i -E 's|^  url ".*"$|  url "https://github.com/adziendziolD/SHOWhisper/releases/download/v#{version}/SHOWhisper-#{version}-mac-arm64.dmg"|' "$CASK"
+          if ! grep -q "version \"${VERSION}\"" "$CASK" || ! grep -q "sha256 \"${SHA}\"" "$CASK"; then
+            echo "::error::Cask rewrite failed"; cat "$CASK"; exit 1
+          fi
+
+          if git diff --quiet -- "$CASK"; then
+            echo "Cask already at ${VERSION} - nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CASK"
+          git commit -m "Homebrew cask: SHOWhisper ${VERSION}"
+          # Retry in case the branch moved meanwhile.
+          for attempt in 1 2 3; do
+            if git pull --rebase -q origin "$BRANCH" && git push origin "HEAD:${BRANCH}"; then
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed, retrying…"
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not push the cask update to ${BRANCH}"
+          exit 1
