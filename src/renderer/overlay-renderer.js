@@ -117,15 +117,9 @@ function stopTimer() {
 // ── Recording ─────────────────────────────────────────────────────────────────
 
 const WHISPER_SAMPLE_RATE = 16000
-// Chunks are cut at a speech pause once MIN_CHUNK_S of audio accumulated, at
-// the latest after MAX_CHUNK_S. Cutting in a pause instead of a fixed window
-// never splits a word, and the final chunk after stop stays short (fast).
-// Not much shorter: Whisper pads every call to a 30 s window, so each chunk
-// costs about the same - too many small ones would build a backlog.
-// ponytail: peak-floor pause detection, not a real VAD (e.g. webrtcvad).
-const MIN_CHUNK_S = 3
-const MAX_CHUNK_S = 8
-const PAUSE_MS = 350
+// Silence trimming/gating and the chunk-cut decision live in src/shared/audio.js
+// (loaded before this script, see overlay.html).
+const { trimSilence, isSilent, concat, blockPeak, shouldCut, TRIM_PEAK_FLOOR } = window.ShowAudio
 
 // Resample a mono PCM buffer to 16 kHz (what Whisper expects). Node can't
 // decode audio, so this runs in the renderer.
@@ -142,44 +136,6 @@ async function resampleTo16k(pcm, rate) {
   src.connect(offline.destination)
   src.start()
   return (await offline.startRendering()).getChannelData(0)
-}
-
-// ponytail: peak-floor trim + mean-absolute-value gate instead of a real VAD
-// - Whisper hallucinates full sentences on silent chunks ("Das war's für
-// heute."), so silence must never reach the model. Trimming leading and
-// trailing silence first keeps a short utterance in a mostly-silent chunk
-// above the gate (and shortens every chunk).
-const SILENCE_AVG_ABS = 0.003
-const TRIM_PEAK_FLOOR = 0.005   // per-sample peak that counts as "audible"
-const TRIM_KEEP_MS = 300        // keep a little margin around speech (onset/decay)
-
-function isSilent(pcm) {
-  let sum = 0
-  for (let i = 0; i < pcm.length; i++) sum += Math.abs(pcm[i])
-  return sum / pcm.length < SILENCE_AVG_ABS
-}
-
-// Cut the silence before the first and after the last audible sample (keeping
-// TRIM_KEEP_MS on both sides). Returns an empty array when nothing is audible.
-function trimSilence(pcm, rate) {
-  let first = -1
-  for (let i = 0; i < pcm.length; i++) {
-    if (Math.abs(pcm[i]) > TRIM_PEAK_FLOOR) { first = i; break }
-  }
-  if (first === -1) return new Float32Array(0)
-  let last = first
-  for (let i = pcm.length - 1; i > first; i--) {
-    if (Math.abs(pcm[i]) > TRIM_PEAK_FLOOR) { last = i; break }
-  }
-  const keep = Math.round((TRIM_KEEP_MS / 1000) * rate)
-  return pcm.subarray(Math.max(0, first - keep), Math.min(pcm.length, last + keep + 1))
-}
-
-function concat(chunks) {
-  const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0))
-  let off = 0
-  for (const c of chunks) { out.set(c, off); off += c.length }
-  return out
 }
 
 // Resample one snapshot and send it to main. Never throws: a broken chunk only
@@ -300,7 +256,6 @@ async function startRecording(id) {
     // fewer file, same throughput for a single mono mic stream.
     const node = r.ctx.createScriptProcessor(4096, 1, 1)
     r.node = node
-    const pauseSamples = (PAUSE_MS / 1000) * r.rate
     node.onaudioprocess = (e) => {
       // Copy: the engine may overwrite the input buffer between callbacks,
       // storing the view directly would alias every entry to the same memory.
@@ -308,13 +263,8 @@ async function startRecording(id) {
       r.pending.push(d)
       r.pendingLen += d.length
       r.total += d.length
-      let peak = 0
-      for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a }
-      r.silentRun = peak > TRIM_PEAK_FLOOR ? 0 : r.silentRun + d.length
-      if (r.pendingLen >= MAX_CHUNK_S * r.rate ||
-          (r.pendingLen >= MIN_CHUNK_S * r.rate && r.silentRun >= pauseSamples)) {
-        queueFlush(r, false)
-      }
+      r.silentRun = blockPeak(d) > TRIM_PEAK_FLOOR ? 0 : r.silentRun + d.length
+      if (shouldCut(r)) queueFlush(r, false)
     }
     const mute = r.ctx.createGain()
     mute.gain.value = 0
